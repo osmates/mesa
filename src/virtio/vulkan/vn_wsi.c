@@ -18,6 +18,11 @@
 #include "vn_instance.h"
 #include "vn_physical_device.h"
 #include "vn_queue.h"
+#include "vn_sync.h"
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+#include <windows.h>
+#endif
 
 #ifndef DRM_FORMAT_MOD_LINEAR
 #define DRM_FORMAT_MOD_LINEAR 0
@@ -288,6 +293,7 @@ vn_wsi_memory_info_init(struct vn_device_memory *mem,
    }
 }
 
+#ifndef VK_USE_PLATFORM_WIN32_KHR
 static uint32_t
 vn_modifier_plane_count(struct vn_physical_device *physical_dev,
                         VkFormat format,
@@ -329,11 +335,13 @@ vn_modifier_plane_count(struct vn_physical_device *physical_dev,
    STACK_ARRAY_FINISH(modifier_props);
    return plane_count;
 }
+#endif
 
 bool
 vn_wsi_validate_image_format_info(struct vn_physical_device *physical_dev,
                                   const VkPhysicalDeviceImageFormatInfo2 *info)
 {
+#ifndef VK_USE_PLATFORM_WIN32_KHR
    const VkPhysicalDeviceImageDrmFormatModifierInfoEXT *modifier_info =
       vk_find_struct_const(
          info->pNext, PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT);
@@ -384,7 +392,7 @@ vn_wsi_validate_image_format_info(struct vn_physical_device *physical_dev,
          return false;
       }
    }
-
+#endif
    return true;
 }
 
@@ -446,6 +454,7 @@ vn_wsi_fence_wait(VkQueue queue_handle)
    return vn_ResetFences(dev_handle, 1, &queue->async_present.fence);
 }
 
+#ifndef VK_USE_PLATFORM_WIN32_KHR
 void
 vn_wsi_sync_wait(struct vn_device *dev, int fd)
 {
@@ -474,6 +483,36 @@ vn_wsi_sync_wait(struct vn_device *dev, int fd)
       simple_mtx_lock(&queue->async_present.queue_mutex);
    }
 }
+#else
+void
+vn_wsi_sync_wait_handle(struct vn_device *dev, void *handle)
+{
+   if (dev->renderer->info.has_implicit_fencing)
+      return;
+
+   const pid_t tid = vn_gettid();
+   struct vn_queue *queue = NULL;
+   for (uint32_t i = 0; i < dev->queue_count; i++) {
+      if (dev->queues[i].async_present.initialized &&
+          dev->queues[i].async_present.tid == tid) {
+         queue = &dev->queues[i];
+         break;
+      }
+   }
+
+   if (queue) {
+      simple_mtx_unlock(&queue->async_present.queue_mutex);
+      vn_wsi_chains_unlock(dev, queue->async_present.info, /*all=*/false);
+   }
+
+   WaitForSingleObject(handle, INFINITE);
+
+   if (queue) {
+      vn_wsi_chains_lock(dev, queue->async_present.info, /*all=*/false);
+      simple_mtx_lock(&queue->async_present.queue_mutex);
+   }
+}
+#endif
 
 void
 vn_wsi_flush(VkQueue queue_handle)
@@ -927,6 +966,17 @@ vn_AcquireNextImage2KHR(VkDevice device,
    if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
       return vn_error(dev->instance, result);
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   if (pAcquireInfo->semaphore != VK_NULL_HANDLE) {
+      struct vn_semaphore *sem =
+         vn_semaphore_from_handle(pAcquireInfo->semaphore);
+      struct vn_sync_payload *temp = &sem->temporary;
+      vn_sync_payload_release(dev, temp);
+      temp->type = VN_SYNC_TYPE_IMPORTED_SYNC_FD;
+      temp->fd = -1;
+      sem->payload = temp;
+   }
+#else
    int sync_fd = -1;
    if (!dev->renderer->info.has_implicit_fencing) {
       VkDeviceMemory mem_handle =
@@ -1006,6 +1056,7 @@ out:
       close(sem_fd);
    if (fence_fd >= 0)
       close(fence_fd);
+#endif
 
    return vn_result(dev->instance, result);
 }
