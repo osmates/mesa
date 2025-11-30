@@ -148,16 +148,35 @@ struct vn_renderer_bo_ops {
       const VkMemoryAllocateInfo *alloc_info,
       struct vn_renderer_bo **out_bo);
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   VkResult (*create_from_handle)(
+      struct vn_renderer *renderer,
+      VkDeviceSize size,
+      /* externally allocated handles might not have a valid id */
+      vn_object_id mem_id,
+      bool is_kmt,
+      void *handle,
+      VkMemoryPropertyFlags flags,
+      const VkMemoryAllocateInfo *alloc_info,
+      struct vn_renderer_bo **out_bo);
+#else
    VkResult (*create_from_dma_buf)(struct vn_renderer *renderer,
                                    VkDeviceSize size,
                                    int fd,
                                    VkMemoryPropertyFlags flags,
                                    struct vn_renderer_bo **out_bo);
+#endif
 
    bool (*destroy)(struct vn_renderer *renderer, struct vn_renderer_bo *bo);
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   void *(*export_handle)(struct vn_renderer *renderer,
+                          struct vn_renderer_bo *bo,
+                          bool is_kmt);
+#else
    int (*export_dma_buf)(struct vn_renderer *renderer,
                          struct vn_renderer_bo *bo);
+#endif
 
    int (*export_sync_file)(struct vn_renderer *renderer,
                            struct vn_renderer_bo *bo);
@@ -331,6 +350,31 @@ vn_renderer_bo_create_from_device_memory(
    return VK_SUCCESS;
 }
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+static inline VkResult
+vn_renderer_bo_create_from_handle(struct vn_renderer *renderer,
+                                  VkDeviceSize size,
+                                  vn_object_id mem_id,
+                                  bool is_kmt,
+                                  void *handle,
+                                  VkMemoryPropertyFlags flags,
+                                  const VkMemoryAllocateInfo *alloc_info,
+                                  struct vn_renderer_bo **out_bo)
+{
+   struct vn_renderer_bo *bo;
+   VkResult result = renderer->bo_ops.create_from_handle(
+      renderer, size, mem_id, is_kmt, handle, flags, alloc_info, &bo);
+   if (result != VK_SUCCESS)
+      return result;
+
+   assert(vn_refcount_is_valid(&bo->refcount));
+   assert(bo->res_id);
+   assert(!bo->mmap_size || bo->mmap_size >= size);
+
+   *out_bo = bo;
+   return VK_SUCCESS;
+}
+#else
 static inline VkResult
 vn_renderer_bo_create_from_dma_buf(struct vn_renderer *renderer,
                                    VkDeviceSize size,
@@ -351,6 +395,7 @@ vn_renderer_bo_create_from_dma_buf(struct vn_renderer *renderer,
    *out_bo = bo;
    return VK_SUCCESS;
 }
+#endif
 
 static inline struct vn_renderer_bo *
 vn_renderer_bo_ref(struct vn_renderer *renderer, struct vn_renderer_bo *bo)
@@ -367,12 +412,22 @@ vn_renderer_bo_unref(struct vn_renderer *renderer, struct vn_renderer_bo *bo)
    return false;
 }
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+static inline void *
+vn_renderer_bo_export_handle(struct vn_renderer *renderer,
+                             struct vn_renderer_bo *bo,
+                             bool is_kmt)
+{
+   return renderer->bo_ops.export_handle(renderer, bo, is_kmt);
+}
+#else
 static inline int
 vn_renderer_bo_export_dma_buf(struct vn_renderer *renderer,
                               struct vn_renderer_bo *bo)
 {
    return renderer->bo_ops.export_dma_buf(renderer, bo);
 }
+#endif
 
 static inline int
 vn_renderer_bo_export_sync_file(struct vn_renderer *renderer,

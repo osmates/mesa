@@ -123,6 +123,59 @@ vn_device_memory_bo_fini(struct vn_device *dev, struct vn_device_memory *mem)
    vn_renderer_bo_unref(dev->renderer, mem->base_bo);
 }
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+static VkResult
+vn_device_memory_import_handle(struct vn_device *dev,
+                               struct vn_device_memory *mem,
+                               const VkMemoryAllocateInfo *alloc_info,
+                               bool is_kmt,
+                               void *handle)
+{
+   const VkMemoryType *mem_type =
+      &dev->physical_device->memory_properties
+          .memoryTypes[alloc_info->memoryTypeIndex];
+   const VkMemoryDedicatedAllocateInfo *dedicated_info =
+      vk_find_struct_const(alloc_info->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
+   const bool is_dedicated =
+      dedicated_info && (dedicated_info->image != VK_NULL_HANDLE ||
+                         dedicated_info->buffer != VK_NULL_HANDLE);
+
+   struct vn_renderer_bo *bo;
+   VkResult result = vn_renderer_bo_create_from_handle(
+      dev->renderer, is_dedicated ? alloc_info->allocationSize : 0,
+      mem->base.id, is_kmt, handle, mem_type->propertyFlags, alloc_info, &bo);
+   if (result != VK_SUCCESS)
+      return result;
+
+   vn_ring_roundtrip(dev->primary_ring);
+
+   const VkImportMemoryResourceInfoMESA import_memory_resource_info = {
+      .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_RESOURCE_INFO_MESA,
+      .pNext = alloc_info->pNext,
+      .resourceId = bo->res_id,
+   };
+   const VkMemoryAllocateInfo memory_allocate_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = &import_memory_resource_info,
+      .allocationSize = alloc_info->allocationSize,
+      .memoryTypeIndex = alloc_info->memoryTypeIndex,
+   };
+
+   result = vn_device_memory_alloc_simple(dev, mem, &memory_allocate_info);
+   if (result != VK_SUCCESS) {
+      vn_renderer_bo_unref(dev->renderer, bo);
+      return result;
+   }
+
+   if (!is_kmt) {
+      /* need to close import fd on success to avoid fd leak */
+      CloseHandle((HANDLE)handle);
+   }
+   mem->base_bo = bo;
+
+   return VK_SUCCESS;
+}
+#else
 VkResult
 vn_device_memory_import_dma_buf(struct vn_device *dev,
                                 struct vn_device_memory *mem,
@@ -165,6 +218,7 @@ vn_device_memory_import_dma_buf(struct vn_device *dev,
 
    return VK_SUCCESS;
 }
+#endif
 
 static VkResult
 vn_device_memory_alloc_guest_vram(struct vn_device *dev,
@@ -322,6 +376,7 @@ vn_device_memory_alloc(struct vn_device *dev,
       alloc_info = vn_device_memory_fix_alloc_info(
          alloc_info, renderer_handle_type, has_guest_vram, &local_info);
 
+      // FIXME: this is slightly wrong for Windows
       /* ensure correct blob flags */
       mem_vk->export_handle_types = renderer_handle_type;
    }
@@ -372,12 +427,13 @@ vn_AllocateMemory(VkDevice device,
 
    vn_object_set_id(mem, vn_get_next_obj_id(), VK_OBJECT_TYPE_DEVICE_MEMORY);
 
+   VkResult result;
+#ifndef VK_USE_PLATFORM_WIN32_KHR
    const VkImportMemoryFdInfoKHR *import_fd_info =
       vk_find_struct_const(pAllocateInfo->pNext, IMPORT_MEMORY_FD_INFO_KHR);
    if (import_fd_info && !import_fd_info->handleType)
       import_fd_info = NULL;
 
-   VkResult result;
    if (mem->base.vk.ahardware_buffer) {
       result = vn_android_device_import_ahb(dev, mem, pAllocateInfo);
    } else if (import_fd_info) {
@@ -388,6 +444,32 @@ vn_AllocateMemory(VkDevice device,
       if (result == VK_SUCCESS)
          vn_wsi_memory_info_init(mem, pAllocateInfo);
    }
+#else
+   const bool has_guest_vram = dev->renderer->info.has_guest_vram;
+   const VkExternalMemoryHandleTypeFlagBits renderer_handle_type =
+      dev->physical_device->external_memory.renderer_handle_type;
+   const VkImportMemoryWin32HandleInfoKHR *import_win32_info =
+      vk_find_struct_const(pAllocateInfo->pNext,
+                           IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR);
+   if (import_win32_info) {
+      const bool is_kmt =
+         !!(import_win32_info->handleType &
+            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT);
+      void *handle = import_win32_info->handle;
+
+      struct vn_device_memory_alloc_info local_info;
+      if (mem->base.vk.export_handle_types &&
+          mem->base.vk.export_handle_types != renderer_handle_type) {
+         pAllocateInfo = vn_device_memory_fix_alloc_info(
+            pAllocateInfo, renderer_handle_type, has_guest_vram, &local_info);
+      }
+
+      result = vn_device_memory_import_handle(dev, mem, pAllocateInfo, is_kmt,
+                                              handle);
+   } else {
+      result = vn_device_memory_alloc(dev, mem, pAllocateInfo);
+   }
+#endif
 
    vn_device_memory_emit_report(dev, mem, /* is_alloc */ true, result);
 
@@ -555,6 +637,98 @@ vn_GetDeviceMemoryCommitment(VkDevice device,
                                        pCommittedMemoryInBytes);
 }
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+VKAPI_ATTR VkResult VKAPI_CALL
+vn_GetMemoryWin32HandleKHR(
+   VkDevice device,
+   const VkMemoryGetWin32HandleInfoKHR *pGetWin32HandleInfo,
+   HANDLE *pHandle)
+{
+   VN_TRACE_FUNC();
+   struct vn_device *dev = vn_device_from_handle(device);
+   struct vn_device_memory *mem =
+      vn_device_memory_from_handle(pGetWin32HandleInfo->memory);
+
+   /* At the moment, we support only the below handle type. */
+   assert(pGetWin32HandleInfo->handleType &
+          (VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+           VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT));
+   assert(mem->base_bo);
+   const bool is_kmt = !(pGetWin32HandleInfo->handleType &
+                         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT);
+   *pHandle =
+      vn_renderer_bo_export_handle(dev->renderer, mem->base_bo, is_kmt);
+   if (*pHandle == NULL)
+      return vn_error(dev->instance, VK_ERROR_TOO_MANY_OBJECTS);
+
+   return VK_SUCCESS;
+}
+
+static VkResult
+vn_get_memory_handle_properties(struct vn_device *dev,
+                                bool is_kmt,
+                                void *handle,
+                                void *alloc_info,
+                                uint32_t *out_mem_type_bits)
+{
+   VkDevice device = vn_device_to_handle(dev);
+
+   struct vn_renderer_bo *bo;
+   VkResult result = vn_renderer_bo_create_from_handle(
+      dev->renderer, 0 /* size */, 0 /* id */, is_kmt, handle, 0 /* flags */,
+      alloc_info, &bo);
+   if (result != VK_SUCCESS) {
+      vn_log(dev->instance, "bo_create_from_handle failed");
+      return result;
+   }
+
+   vn_ring_roundtrip(dev->primary_ring);
+
+   VkMemoryResourcePropertiesMESA props = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA,
+   };
+   result = vn_call_vkGetMemoryResourcePropertiesMESA(
+      dev->primary_ring, device, bo->res_id, &props);
+   vn_renderer_bo_unref(dev->renderer, bo);
+   if (result != VK_SUCCESS) {
+      vn_log(dev->instance, "vkGetMemoryResourcePropertiesMESA failed");
+      return result;
+   }
+
+   *out_mem_type_bits = props.memoryTypeBits;
+
+   return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL
+vn_GetMemoryWin32HandlePropertiesKHR(
+   VkDevice device,
+   VkExternalMemoryHandleTypeFlagBits handleType,
+   HANDLE handle,
+   VkMemoryWin32HandlePropertiesKHR *pMemoryWin32HandleProperties)
+{
+   VN_TRACE_FUNC();
+   struct vn_device *dev = vn_device_from_handle(device);
+   uint32_t mem_type_bits = 0;
+   VkResult result = VK_SUCCESS;
+
+   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT &&
+       handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT)
+      return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+
+   const bool is_kmt =
+      handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+
+   result = vn_get_memory_handle_properties(
+      dev, is_kmt, handle, pMemoryWin32HandleProperties, &mem_type_bits);
+   if (result != VK_SUCCESS)
+      return vn_error(dev->instance, result);
+
+   pMemoryWin32HandleProperties->memoryTypeBits = mem_type_bits;
+
+   return VK_SUCCESS;
+}
+#else
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_GetMemoryFdKHR(VkDevice device,
                   const VkMemoryGetFdInfoKHR *pGetFdInfo,
@@ -632,3 +806,4 @@ vn_GetMemoryFdPropertiesKHR(VkDevice device,
 
    return VK_SUCCESS;
 }
+#endif

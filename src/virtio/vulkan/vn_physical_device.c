@@ -1091,9 +1091,13 @@ vn_physical_device_init_external_memory(
       physical_dev->external_memory.renderer_handle_type =
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
 
-#ifdef VK_USE_PLATFORM_ANDROID_KHR
+#if defined(VK_USE_PLATFORM_ANDROID_KHR)
       physical_dev->external_memory.supported_handle_types |=
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+#elif defined(VK_USE_PLATFORM_WIN32_KHR)
+      physical_dev->external_memory.supported_handle_types =
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
 #else
       physical_dev->external_memory.supported_handle_types =
          VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
@@ -1178,10 +1182,13 @@ vn_physical_device_get_native_extensions(
    }
 #else  /* VK_USE_PLATFORM_ANDROID_KHR */
    if (physical_dev->external_memory.renderer_handle_type) {
-#if !DETECT_OS_WINDOWS
+#if DETECT_OS_WINDOWS
+      exts->KHR_external_memory_win32 = true;
+      /* TODO: exts->KHR_win32_keyed_mutex = true */
+#else
       exts->KHR_external_memory_fd = true;
       exts->EXT_external_memory_dma_buf = true;
-#endif /* !DETECT_OS_WINDOWS */
+#endif /* DETECT_OS_WINDOWS */
    }
 #endif /* VK_USE_PLATFORM_ANDROID_KHR */
 
@@ -1387,9 +1394,9 @@ vn_physical_device_get_passthrough_extensions(
       .EXT_global_priority_query = true,
       .EXT_graphics_pipeline_library = !VN_DEBUG(NO_GPL),
       .EXT_image_2d_view_of_3d = true,
-#if !DETECT_OS_WINDOWS
+      // #if !DETECT_OS_WINDOWS
       .EXT_image_drm_format_modifier = true,
-#endif
+      // #endif
       .EXT_image_sliced_view_of_3d = true,
       .EXT_image_view_min_lod = true,
       .EXT_index_type_uint8 = true,
