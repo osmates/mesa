@@ -29,19 +29,23 @@ vn_entrypoints = custom_target(
 )
 
 icd_file_name = libname_prefix + 'vulkan_virtio.' + libname_suffix
+icd_command = [
+  prog_python, '@INPUT0@',
+  '--api-version', '1.4', '--xml', '@INPUT1@',
+  '--sizeof-pointer', sizeof_pointer,
+  '--icd-lib-path', vulkan_icd_lib_path,
+  '--icd-filename', icd_file_name,
+  '--out', '@OUTPUT@',
+]
+if with_platform_windows
+  icd_command += '--use-backslash'
+endif
 
 virtio_icd = custom_target(
   'virtio_icd',
   input : [vk_icd_gen, vk_api_xml],
   output : 'virtio_icd.' + vulkan_manifest_suffix,
-  command : [
-    prog_python, '@INPUT0@',
-    '--api-version', '1.4', '--xml', '@INPUT1@',
-    '--sizeof-pointer', sizeof_pointer,
-    '--icd-lib-path', vulkan_icd_lib_path,
-    '--icd-filename', icd_file_name,
-    '--out', '@OUTPUT@',
-  ],
+  command : icd_command,
   build_by_default : true,
   install_dir : with_vulkan_icd_dir,
   install_tag : 'runtime',
@@ -122,6 +126,8 @@ vn_link_args = [
   vulkan_icd_link_args,
 ]
 
+vn_kwargs = {}
+
 vn_libs = []
 
 if not with_platform_windows
@@ -156,6 +162,16 @@ if with_platform_android
   vn_deps += [dep_android, idep_u_gralloc]
 endif
 
+if with_platform_windows
+  libvn_files += files('vn_renderer_virtgpu_win32.c')
+  vn_incs += inc_winddk
+  vn_link_args += '-static'
+  vn_kwargs = {
+    'vs_module_defs': vulkan_api_def,
+    'name_prefix': '',
+  }
+endif
+
 libvulkan_virtio = shared_library(
   'vulkan_virtio',
   [libvn_files, vn_entrypoints, vn_drirc, sha1_h],
@@ -166,5 +182,6 @@ libvulkan_virtio = shared_library(
   link_args : vn_link_args,
   link_depends : vulkan_icd_link_depends,
   gnu_symbol_visibility : 'hidden',
+  kwargs: vn_kwargs,
   install : true,
 )
