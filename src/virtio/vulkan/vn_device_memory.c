@@ -22,6 +22,10 @@
 #include "vn_renderer.h"
 #include "vn_renderer_util.h"
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+#include "vk_internal_d3dddi_ext.h"
+#endif
+
 /* device memory commands */
 
 static inline VkResult
@@ -304,6 +308,10 @@ struct vn_device_memory_alloc_info {
    VkMemoryAllocateFlagsInfo flags;
    VkMemoryDedicatedAllocateInfo dedicated;
    VkMemoryOpaqueCaptureAddressAllocateInfo capture;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   VkD3DDDICreateResourceMESA d3d_create;
+   VkD3DDDIOpenResourceMESA d3d_open;
+#endif
 };
 
 static const VkMemoryAllocateInfo *
@@ -318,7 +326,10 @@ vn_device_memory_fix_alloc_info(
 
    vk_foreach_struct_const(sType, src, alloc_info->pNext) {
       void *next = NULL;
-      switch (sType) {
+      /* VK_STRUCTURE_TYPE_D3DDDI_*_MESA aren't a real enum values, so use
+       * cast to avoid compiler warn
+       */
+      switch ((uint32_t)sType) {
       case VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO:
          /* guest vram turns export alloc into import, so drop export info */
          if (has_guest_vram)
@@ -339,6 +350,16 @@ vn_device_memory_fix_alloc_info(
          memcpy(&local_info->capture, src, sizeof(local_info->capture));
          next = &local_info->capture;
          break;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+      case VK_STRUCTURE_TYPE_D3DDDI_CREATE_RESOURCE_MESA:
+         memcpy(&local_info->d3d_create, src, sizeof(local_info->d3d_create));
+         next = &local_info->d3d_create;
+         break;
+      case VK_STRUCTURE_TYPE_D3DDDI_OPEN_RESOURCE_MESA:
+         memcpy(&local_info->d3d_open, src, sizeof(local_info->d3d_open));
+         next = &local_info->d3d_open;
+         break;
+#endif
       default:
          break;
       }
@@ -380,6 +401,16 @@ vn_device_memory_alloc(struct vn_device *dev,
       /* ensure correct blob flags */
       mem_vk->export_handle_types = renderer_handle_type;
    }
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   const bool need_bo_now =
+      vk_find_struct_const(alloc_info, D3DDDI_CREATE_RESOURCE_MESA) != NULL ||
+      vk_find_struct_const(alloc_info, D3DDDI_OPEN_RESOURCE_MESA) != NULL;
+
+   if (need_bo_now) {
+      return vn_device_memory_alloc_export(dev, mem, alloc_info);
+   }
+#endif
 
    if (has_guest_vram && (host_visible || export_alloc)) {
       return vn_device_memory_alloc_guest_vram(dev, mem, alloc_info);
