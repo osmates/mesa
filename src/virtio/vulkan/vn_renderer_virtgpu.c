@@ -651,10 +651,12 @@ static VkResult
 virtgpu_bo_create_from_device_memory(
    struct vn_renderer *renderer,
    struct vn_renderer_submit_batch *batch,
+   VkDevice device,
    VkDeviceSize size,
    vn_object_id mem_id,
    VkMemoryPropertyFlags flags,
    VkExternalMemoryHandleTypeFlags external_handles,
+   const VkMemoryAllocateInfo *alloc_info,
    struct vn_renderer_bo **out_bo)
 {
    struct virtgpu *gpu = (struct virtgpu *)renderer;
