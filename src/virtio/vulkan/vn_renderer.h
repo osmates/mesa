@@ -122,7 +122,20 @@ struct vn_renderer_ops {
 
    VkResult (*submit)(struct vn_renderer *renderer,
                       const struct vn_renderer_submit_batch *batch);
-
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   /*
+    * Same as vn_renderer_ops::submit, but vn_renderer_submit_batch::syncs
+    * are considered in-syncobjs, that is, they are waited in guest before
+    * submitting the command to host, instead of being signalled when the
+    * command completes (out-syncobjs). This is required to make host honor
+    * external (non-vk) guest syncobj signals.
+    *
+    * TODO: support more shared semaphore handle types on Linux and Windows
+    * TODO: bool no_explicit_ordering
+    */
+   VkResult (*submit_wait)(struct vn_renderer *renderer,
+                           const struct vn_renderer_submit_batch *batch);
+#endif
    /*
     * On success, returns VK_SUCCESS or VK_TIMEOUT.  On failure, returns
     * VK_ERROR_DEVICE_LOST or out of device/host memory.
@@ -208,17 +221,33 @@ struct vn_renderer_sync_ops {
    VkResult (*create)(struct vn_renderer *renderer,
                       uint64_t initial_val,
                       struct vn_renderer_sync **out_sync);
-
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   VkResult (*create_from_handle)(struct vn_renderer *renderer,
+                                  void *handle,
+                                  VkExternalSemaphoreHandleTypeFlagBits type,
+                                  struct vn_renderer_sync **out_sync);
+#else
    VkResult (*create_from_syncobj)(struct vn_renderer *renderer,
                                    int fd,
                                    bool sync_file,
                                    struct vn_renderer_sync **out_sync);
+#endif
+
    void (*destroy)(struct vn_renderer *renderer,
                    struct vn_renderer_sync *sync);
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   void *(*export_handle)(
+      struct vn_renderer *renderer,
+      struct vn_renderer_sync *sync,
+      VkExternalSemaphoreHandleTypeFlagBits type,
+      /* Valid when type = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT */
+      uint64_t async_event_value);
+#else
    int (*export_syncobj)(struct vn_renderer *renderer,
                          struct vn_renderer_sync *sync,
                          bool sync_file);
+#endif
 
    /* reset the counter to zero */
    VkResult (*reset)(struct vn_renderer *renderer,
@@ -291,6 +320,15 @@ vn_renderer_submit(struct vn_renderer *renderer,
 {
    return renderer->ops.submit(renderer, submit);
 }
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+static inline VkResult
+vn_renderer_submit_wait(struct vn_renderer *renderer,
+                        const struct vn_renderer_submit_batch *submit)
+{
+   return renderer->ops.submit_wait(renderer, submit);
+}
+#endif
 
 static inline VkResult
 vn_renderer_wait(struct vn_renderer *renderer,
@@ -488,6 +526,17 @@ vn_renderer_sync_create(struct vn_renderer *renderer,
    return renderer->sync_ops.create(renderer, initial_val, out_sync);
 }
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+static inline VkResult
+vn_renderer_sync_create_from_handle(struct vn_renderer *renderer,
+                                    void *handle,
+                                    VkExternalSemaphoreHandleTypeFlagBits type,
+                                    struct vn_renderer_sync **out_sync)
+{
+   return renderer->sync_ops.create_from_handle(renderer, handle, type,
+                                                out_sync);
+}
+#else
 static inline VkResult
 vn_renderer_sync_create_from_syncobj(struct vn_renderer *renderer,
                                      int fd,
@@ -497,6 +546,7 @@ vn_renderer_sync_create_from_syncobj(struct vn_renderer *renderer,
    return renderer->sync_ops.create_from_syncobj(renderer, fd, sync_file,
                                                  out_sync);
 }
+#endif
 
 static inline void
 vn_renderer_sync_destroy(struct vn_renderer *renderer,
@@ -505,6 +555,17 @@ vn_renderer_sync_destroy(struct vn_renderer *renderer,
    renderer->sync_ops.destroy(renderer, sync);
 }
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+static inline void *
+vn_renderer_sync_export_handle(struct vn_renderer *renderer,
+                               struct vn_renderer_sync *sync,
+                               VkExternalSemaphoreHandleTypeFlagBits type,
+                               uint64_t async_event_value)
+{
+   return renderer->sync_ops.export_handle(renderer, sync, type,
+                                           async_event_value);
+}
+#else
 static inline int
 vn_renderer_sync_export_syncobj(struct vn_renderer *renderer,
                                 struct vn_renderer_sync *sync,
@@ -512,6 +573,7 @@ vn_renderer_sync_export_syncobj(struct vn_renderer *renderer,
 {
    return renderer->sync_ops.export_syncobj(renderer, sync, sync_file);
 }
+#endif
 
 static inline VkResult
 vn_renderer_sync_reset(struct vn_renderer *renderer,

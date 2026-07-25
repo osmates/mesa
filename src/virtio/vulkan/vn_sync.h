@@ -8,6 +8,7 @@
 
 #include "vn_common.h"
 
+#include "vn_device.h"
 #include "vn_feedback.h"
 
 enum vn_sync_type {
@@ -40,8 +41,14 @@ struct vn_sync_payload {
       /* If type is VN_SYNC_TYPE_TIMELINE_SYNC, syncs are non-NULL. */
       struct vn_renderer_sync **syncs;
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+      /* If type is VN_SYNC_TYPE_IMPORTED_SYNC_FD, fd is an async event
+       * handle. */
+      intptr_t fd;
+#else
       /* If type is VN_SYNC_TYPE_IMPORTED_SYNC_FD, fd is a sync file. */
       int fd;
+#endif
    };
 };
 
@@ -63,6 +70,10 @@ struct vn_semaphore {
 
    VkSemaphoreType type;
    bool sync_fd_export;
+   bool syncobj_exported;
+
+   /* last value known to vk, either current or pending */
+   uint64_t last_value;
 
    struct vn_sync_payload *payload;
 
@@ -112,11 +123,52 @@ vn_signal_semaphore_is_sync_fd(VkSemaphore sem_handle)
    return sem->permanent.type == VN_SYNC_TYPE_SYNC && sem->sync_fd_export;
 }
 
+static inline bool
+vn_semaphore_is_exported(VkSemaphore sem_handle)
+{
+   struct vn_semaphore *sem = vn_semaphore_from_handle(sem_handle);
+   return sem->syncobj_exported;
+}
+
+static inline uint64_t
+vn_semaphore_get_last_value(VkSemaphore sem_handle)
+{
+   assert(vn_semaphore_is_timeline(sem_handle));
+   struct vn_semaphore *sem = vn_semaphore_from_handle(sem_handle);
+   return sem->last_value;
+}
+
 bool
 vn_semaphore_wait_sync_fd(VkDevice dev_handle, VkSemaphore sem_handle);
 
 void
 vn_sync_payload_release(struct vn_device *dev,
                         struct vn_sync_payload *payload);
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+VkResult
+vn_submit_semaphore_signal(VkDevice dev_handle,
+                           VkSemaphore sem_handle,
+                           uint64_t sem_value,
+                           struct vn_renderer_sync *const *syncs,
+                           uint64_t *sync_values,
+                           uint32_t sync_count);
+
+static inline VkResult
+vn_submit_external_timeline_signal(VkDevice dev_handle,
+                                   VkSemaphore sem_handle,
+                                   uint64_t sem_value)
+{
+   assert(vn_semaphore_is_exported(sem_handle));
+   assert(vn_semaphore_is_timeline(sem_handle));
+
+   struct vn_device *dev = vn_device_from_handle(dev_handle);
+   struct vn_semaphore *sem = vn_semaphore_from_handle(sem_handle);
+   struct vn_renderer_sync *wait_sync = sem->payload->syncs[dev->queue_count];
+
+   return vn_submit_semaphore_signal(dev_handle, sem_handle, sem_value,
+                                     &wait_sync, &sem_value, 1);
+}
+#endif
 
 #endif /* VN_SYNC_H */

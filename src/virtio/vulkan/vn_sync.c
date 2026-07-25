@@ -156,12 +156,17 @@ vn_GetFenceStatus(VkDevice device, VkFence _fence)
       if (result == VK_SUCCESS)
          result = val ? VK_SUCCESS : VK_NOT_READY;
    } else {
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+      UNREACHABLE("Fence must be a renderer sync, not an event handle");
+      result = VK_ERROR_DEVICE_LOST;
+#else
       assert(payload->type == VN_SYNC_TYPE_IMPORTED_SYNC_FD);
 
       if (payload->fd < 0 || sync_wait(payload->fd, 0) == 0)
          result = VK_SUCCESS;
       else
          result = errno == ETIME ? VK_NOT_READY : VK_ERROR_DEVICE_LOST;
+#endif
    }
 
    return vn_result(dev->instance, result);
@@ -211,6 +216,7 @@ vn_WaitForFences(VkDevice device,
       VK_FROM_HANDLE(vn_fence, fence, pFences[i]);
       struct vn_sync_payload *payload = fence->payload;
 
+#ifndef VK_USE_PLATFORM_WIN32_KHR
       if (payload->type == VN_SYNC_TYPE_IMPORTED_SYNC_FD) {
          const int poll_timeout = vn_timeout_to_poll_timeout(timeout);
          if (payload->fd >= 0 && sync_wait(payload->fd, poll_timeout)) {
@@ -222,6 +228,7 @@ vn_WaitForFences(VkDevice device,
 
          continue;
       }
+#endif
 
       assert(payload->type == VN_SYNC_TYPE_SYNC);
 
@@ -249,6 +256,8 @@ out_stack_arr_fini:
    return vn_result(dev->instance, result);
 }
 
+/* TODO: external fences */
+#ifndef VK_USE_PLATFORM_WIN32_KHR
 static inline bool
 vn_sync_valid_fd(int fd)
 {
@@ -316,6 +325,7 @@ vn_GetFenceFdKHR(VkDevice device,
    *pFd = fd;
    return VK_SUCCESS;
 }
+#endif
 
 /* semaphore commands */
 
@@ -348,8 +358,13 @@ vn_semaphore_wait_sync_fd(VkDevice dev_handle, VkSemaphore sem_handle)
           payload == &sem->temporary);
 
    if (payload->fd >= 0) {
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+      UNREACHABLE("Semaphore must be a renderer sync, not an event handle");
+      return false;
+#else
       if (sync_wait(payload->fd, -1))
          return false;
+#endif
    }
 
    vn_sync_payload_release(dev, &sem->temporary);
@@ -451,10 +466,46 @@ vn_CreateSemaphore(VkDevice device,
    }
 
    VkSemaphore sem_handle = vn_semaphore_to_handle(sem);
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   /* Drop VkExportSemaphoreCreateInfo as it may contain unsupported handle
+    * types
+    * TODO: do we need exportable host semaphores? */
+   VkSemaphoreCreateInfo local_create_info;
+   VkSemaphoreTypeCreateInfo local_type_info;
+
+   if (export_info) {
+      local_create_info = *pCreateInfo;
+      local_create_info.pNext = NULL;
+      pCreateInfo = &local_create_info;
+
+      if (type_info) {
+         local_type_info = *type_info;
+         local_type_info.pNext = NULL;
+         __vk_append_struct(&local_create_info, &local_type_info);
+      }
+
+      /* If semaphore is exported, we need to create it synchronously to avoid
+       * object lookup failures later.
+       * TODO: is vn_ring_roundtrip in vn_QueueSubmit* enough?
+       */
+      VkResult result = vn_call_vkCreateSemaphore(dev->primary_ring, device,
+                                                  pCreateInfo, NULL,
+                                                  &sem_handle);
+      if (result != VK_SUCCESS)
+         goto out_payloads_fini;
+
+      *pSemaphore = sem_handle;
+
+      return VK_SUCCESS;
+   }
+#endif
+
    if (!sem->sync_fd_export) {
       vn_async_vkCreateSemaphore(dev->primary_ring, device, pCreateInfo, NULL,
                                  &sem_handle);
    }
+
 
    *pSemaphore = sem_handle;
 
@@ -606,6 +657,7 @@ vn_SignalSemaphore(VkDevice device, const VkSemaphoreSignalInfo *pSignalInfo)
    struct vn_semaphore *sem =
       vn_semaphore_from_handle(pSignalInfo->semaphore);
    struct vn_sync_payload *payload = sem->payload;
+   sem->last_value = MAX2(pSignalInfo->value, sem->last_value);
 
    vn_async_vkSignalSemaphore(dev->primary_ring, device, pSignalInfo);
 
@@ -797,6 +849,28 @@ vn_WaitSemaphores(VkDevice device,
    return vn_result(dev->instance, result);
 }
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+VKAPI_ATTR VkResult VKAPI_CALL
+vn_GetSemaphoreWin32HandleKHR(
+   VkDevice device,
+   const VkSemaphoreGetWin32HandleInfoKHR *pGetWin32HandleInfo,
+   HANDLE *pHandle)
+{
+   VN_TRACE_FUNC();
+   struct vn_device *dev = vn_device_from_handle(device);
+   struct vn_semaphore *sem =
+      vn_semaphore_from_handle(pGetWin32HandleInfo->semaphore);
+
+   assert(sem->payload->type == VN_SYNC_TYPE_TIMELINE_SYNC);
+   /* Export cpu sync */
+   struct vn_renderer_sync *sync = sem->payload->syncs[dev->queue_count];
+   *pHandle = vn_renderer_sync_export_handle(
+      dev->renderer, sync, pGetWin32HandleInfo->handleType, 0);
+   sem->syncobj_exported = true;
+
+   return VK_SUCCESS;
+}
+#else
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_ImportSemaphoreFdKHR(
    VkDevice device, const VkImportSemaphoreFdInfoKHR *pImportSemaphoreFdInfo)
@@ -861,6 +935,47 @@ vn_GetSemaphoreFdKHR(VkDevice device,
    *pFd = fd;
    return VK_SUCCESS;
 }
+#endif
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+VkResult
+vn_submit_semaphore_signal(VkDevice dev_handle,
+                           VkSemaphore sem_handle,
+                           uint64_t sem_value,
+                           struct vn_renderer_sync *const *syncs,
+                           uint64_t *sync_values,
+                           uint32_t sync_count)
+{
+   struct vn_device *dev = vn_device_from_handle(dev_handle);
+
+   uint32_t local_data[16];
+   struct vn_cs_encoder local_enc =
+      VN_CS_ENCODER_INITIALIZER_LOCAL(local_data, sizeof(local_data));
+
+   vn_encode_vkSignalSemaphore(
+      &local_enc, 0, dev_handle,
+      &(VkSemaphoreSignalInfo){
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO,
+         .semaphore = sem_handle,
+         .value = sem_value,
+      });
+
+   /* TODO: which ring would be the best to use here?
+    * I guess 0 should be fine for "implicit sync" semaphore, but the externally
+    * signalled ones might benefit from creating a separate context
+    */
+   struct vn_renderer_submit_batch batch = {
+      .cs_data = local_data,
+      .cs_size = vn_cs_encoder_get_len(&local_enc),
+      .ring_idx = 0,
+      .syncs = syncs,
+      .sync_values = sync_values,
+      .sync_count = sync_count,
+   };
+
+   return vn_renderer_submit_wait(dev->renderer, &batch);
+}
+#endif
 
 /* event commands */
 

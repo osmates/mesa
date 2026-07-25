@@ -65,11 +65,12 @@ struct vn_queue_submission {
 
    uint32_t cmd_count;
    uint32_t dev_mask_count;
+   uint32_t wait_sync_count;
    uint32_t wait_index_count;
    uint32_t wait_val_count;
    uint32_t wait_sem_count;
    uint32_t wait_stage_count;
-   uint32_t sync_count;
+   uint32_t sig_sync_count;
    uint32_t sig_index_count;
    uint32_t sig_val_count;
    uint32_t sig_sem_count;
@@ -97,9 +98,9 @@ struct vn_queue_submission {
     *  - fix semaphore handles or infos for dropped wait semaphores
     * wait_stages
     *  - fix stage mask in VkSubmitInfo for dropped wait semaphores
-    * syncs
+    * sig_syncs
     *  - renderer syncs to signal
-    * sync_vals
+    * sig_sync_vals
     *  - renderer sync vals to signal
     * sig_indices
     *  - fix signal dev indices in the pNext chain
@@ -130,8 +131,8 @@ struct vn_queue_submission {
       };
       uint64_t *wait_vals;
       VkPipelineStageFlags *wait_stages;
-      struct vn_renderer_sync **syncs;
-      uint64_t *sync_vals;
+      struct vn_renderer_sync **sig_syncs;
+      uint64_t *sig_sync_vals;
       uint32_t *sig_indices;
       uint64_t *sig_vals;
       union {
@@ -299,6 +300,30 @@ vn_set_temp_cmd(struct vn_queue_submission *submit,
 }
 
 static uint64_t
+vn_get_wait_semaphore_counter(struct vn_queue_submission *submit,
+                              uint32_t index)
+{
+   switch (submit->batch_type) {
+   case VK_STRUCTURE_TYPE_SUBMIT_INFO: {
+      const VkTimelineSemaphoreSubmitInfo *timeline_sem_info =
+         vk_find_struct_const(submit->submit_batch->pNext,
+                              TIMELINE_SEMAPHORE_SUBMIT_INFO);
+      return timeline_sem_info->pWaitSemaphoreValues[index];
+   }
+   case VK_STRUCTURE_TYPE_SUBMIT_INFO_2:
+      return submit->submit2_batch->pWaitSemaphoreInfos[index].value;
+   case VK_STRUCTURE_TYPE_BIND_SPARSE_INFO: {
+      const VkTimelineSemaphoreSubmitInfo *timeline_sem_info =
+         vk_find_struct_const(submit->sparse_batch->pNext,
+                              TIMELINE_SEMAPHORE_SUBMIT_INFO);
+      return timeline_sem_info->pWaitSemaphoreValues[index];
+   }
+   default:
+      UNREACHABLE("unexpected batch type");
+   }
+}
+
+static uint64_t
 vn_get_signal_semaphore_counter(struct vn_queue_submission *submit,
                                 uint32_t index)
 {
@@ -444,8 +469,10 @@ vn_queue_submission_init_pnext(struct vn_queue_submission *submit)
             assert(submit->wait_val_count ==
                    vn_get_wait_semaphore_count(submit));
 
+            const uint32_t wait_val_count =
+               vn_get_wait_semaphore_count(submit);
             uint32_t j = 0;
-            for (uint32_t i = 0; i < submit->wait_val_count; i++) {
+            for (uint32_t i = 0; i < wait_val_count; i++) {
                VkSemaphore sem_handle = vn_get_wait_semaphore(submit, i);
                if (vn_wait_semaphore_is_sync_fd(sem_handle))
                   continue;
@@ -521,6 +548,9 @@ vn_queue_submission_count_semaphore(struct vn_queue_submission *submit)
       bool sig_timeline;
    } fix = { 0 };
 
+   if (!submit->submit_batch)
+      return;
+
    const uint32_t wait_count = vn_get_wait_semaphore_count(submit);
    for (uint32_t i = 0; i < wait_count; i++) {
       VkSemaphore sem_handle = vn_get_wait_semaphore(submit, i);
@@ -534,7 +564,7 @@ vn_queue_submission_count_semaphore(struct vn_queue_submission *submit)
       if (vn_signal_semaphore_is_sync_fd(sem_handle)) {
          fix.sig_sync_fd = true;
          submit->fix.sync_sem = true;
-         submit->sync_count++;
+         submit->sig_sync_count++;
       }
 
       if (vn_semaphore_is_timeline(sem_handle)) {
@@ -544,7 +574,12 @@ vn_queue_submission_count_semaphore(struct vn_queue_submission *submit)
 
          if (sem->payload->type == VN_SYNC_TYPE_TIMELINE_SYNC) {
             submit->fix.sync_sem = true;
-            submit->sync_count++;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+            /* Each timeline semaphore is 2 syncs */
+            submit->sig_sync_count += 2;
+#else
+            submit->sig_sync_count++;
+#endif
          }
       }
    }
@@ -652,7 +687,7 @@ vn_queue_submission_count_fence(struct vn_queue_submission *submit)
       return;
 
    submit->fix.sync_fence = true;
-   submit->sync_count++;
+   submit->sig_sync_count++;
 }
 
 static void
@@ -676,8 +711,8 @@ vn_queue_submission_alloc_storage(struct vn_queue_submission *submit)
       size_t wait_vals;
       size_t wait_sems;
       size_t wait_stages;
-      size_t syncs;
-      size_t sync_vals;
+      size_t sig_syncs;
+      size_t sig_sync_vals;
       size_t sig_indices;
       size_t sig_vals;
       size_t sig_sems;
@@ -692,8 +727,8 @@ vn_queue_submission_alloc_storage(struct vn_queue_submission *submit)
    total += size.wait_vals = submit->wait_val_count * sizeof(uint64_t);
    total += size.wait_sems = submit->wait_sem_count * vn_get_sem_size(submit);
    total += size.wait_stages = submit->wait_stage_count * sizeof(VkPipelineStageFlags);
-   total += size.syncs = submit->sync_count * sizeof(void *);
-   total += size.sync_vals = submit->sync_count * sizeof(uint64_t);
+   total += size.sig_syncs = submit->sig_sync_count * sizeof(void *);
+   total += size.sig_sync_vals = submit->sig_sync_count * sizeof(uint64_t);
    total += size.sig_indices = submit->sig_index_count * sizeof(uint32_t);
    total += size.sig_vals = submit->sig_val_count * sizeof(uint64_t);
    total += size.sig_sems = submit->sig_sem_count * vn_get_sem_size(submit);
@@ -712,9 +747,9 @@ vn_queue_submission_alloc_storage(struct vn_queue_submission *submit)
    submit->temp.wait_vals = (void *)(storage += size.wait_indices);
    submit->temp.wait_sems = (void *)(storage += size.wait_vals);
    submit->temp.wait_stages = (void *)(storage += size.wait_sems);
-   submit->temp.syncs = (void *)(storage += size.wait_stages);
-   submit->temp.sync_vals = (void *)(storage += size.syncs);
-   submit->temp.sig_indices = (void *)(storage += size.sync_vals);
+   submit->temp.sig_syncs = (void *)(storage += size.wait_stages);
+   submit->temp.sig_sync_vals = (void *)(storage += size.sig_syncs);
+   submit->temp.sig_indices = (void *)(storage += size.sig_sync_vals);
    submit->temp.sig_vals = (void *)(storage += size.sig_indices);
    submit->temp.sig_sems = (void *)(storage += size.sig_vals);
 
@@ -943,8 +978,8 @@ vn_queue_submission_init_wait_semaphores(struct vn_queue_submission *submit)
    if (!submit->wait_sem_count)
       return VK_SUCCESS;
 
-   struct vk_queue *queue_vk = vk_queue_from_handle(submit->queue_handle);
-   VkDevice dev_handle = vk_device_to_handle(queue_vk->base.device);
+   struct vn_queue *queue = vn_queue_from_handle(submit->queue_handle);
+   VkDevice dev_handle = vk_device_to_handle(queue->base.vk.base.device);
 
    uint32_t j = 0;
    const uint32_t wait_count = vn_get_wait_semaphore_count(submit);
@@ -1007,6 +1042,12 @@ vn_queue_submission_init_signal_semaphores(struct vn_queue_submission *submit)
          continue;
       }
 
+      if (vn_semaphore_is_timeline(sem_handle)) {
+         struct vn_semaphore *sem = vn_semaphore_from_handle(sem_handle);
+         uint64_t signal_value = vn_get_signal_semaphore_counter(submit, i);
+         sem->last_value = MAX2(signal_value, sem->last_value);
+      }
+
       if (submit->batch_type == VK_STRUCTURE_TYPE_SUBMIT_INFO_2) {
          submit->temp.sig_sem_infos[j++] =
             submit->submit2_batch->pSignalSemaphoreInfos[i];
@@ -1037,10 +1078,13 @@ vn_queue_submission_init_signal_semaphores(struct vn_queue_submission *submit)
 }
 
 static void
-vn_queue_submission_init_syncs(struct vn_queue_submission *submit)
+vn_queue_submission_init_signal_syncs(struct vn_queue_submission *submit)
 {
+
    VK_FROM_HANDLE(vn_queue, queue, submit->queue_handle);
    uint32_t sync_index = 0;
+
+   struct vn_device *dev = vn_device_from_vk(queue->base.vk.base.device);
 
    const uint32_t sig_count = vn_get_signal_semaphore_count(submit);
    for (uint32_t i = 0; i < sig_count; i++) {
@@ -1048,12 +1092,26 @@ vn_queue_submission_init_syncs(struct vn_queue_submission *submit)
       VK_FROM_HANDLE(vn_semaphore, sem, sem_handle);
 
       if (sem->payload->type == VN_SYNC_TYPE_SYNC) {
-         submit->temp.syncs[sync_index] = sem->payload->sync;
-         submit->temp.sync_vals[sync_index++] = 1;
+         submit->temp.sig_syncs[sync_index] = sem->payload->sync;
+         submit->temp.sig_sync_vals[sync_index++] = 1;
       } else if (sem->payload->type == VN_SYNC_TYPE_TIMELINE_SYNC) {
          const uint64_t sync_val = vn_get_signal_semaphore_counter(submit, i);
-         submit->temp.syncs[sync_index] = sem->payload->syncs[queue->index];
-         submit->temp.sync_vals[sync_index++] = sync_val;
+         submit->temp.sig_syncs[sync_index] =
+            sem->payload->syncs[queue->index];
+         submit->temp.sig_sync_vals[sync_index++] = sync_val;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+         /* vn_GetSemaphoreWin32HandleKHR will export "CPU sync" for WSI
+          * in_fence consumption, that is, for the call to
+          * D3DKMTWaitForSynchronizationObjectFromGpu before D3DKMTPresent,
+          * so it needs to also be signaled here.
+          *
+          * NOTE: Import is not yet handled, only external guest-side
+          * signalling
+          */
+         submit->temp.sig_syncs[sync_index] =
+            sem->payload->syncs[dev->queue_count];
+         submit->temp.sig_sync_vals[sync_index++] = sync_val;
+#endif
       }
    }
 
@@ -1062,8 +1120,8 @@ vn_queue_submission_init_syncs(struct vn_queue_submission *submit)
 
       assert(fence->payload->type == VN_SYNC_TYPE_SYNC);
 
-      submit->temp.syncs[sync_index] = fence->payload->sync;
-      submit->temp.sync_vals[sync_index] = 1;
+      submit->temp.sig_syncs[sync_index] = fence->payload->sync;
+      submit->temp.sig_sync_vals[sync_index] = 1;
 
       /* fence is backed by renderer sync without renderer object */
       submit->fence_handle = VK_NULL_HANDLE;
@@ -1092,7 +1150,7 @@ vn_queue_submission_init(struct vn_queue_submission *submit)
    if (result != VK_SUCCESS)
       return result;
 
-   vn_queue_submission_init_syncs(submit);
+   vn_queue_submission_init_signal_syncs(submit);
 
    /* signal semaphore are initialized after syncs are extracted */
    vn_queue_submission_init_signal_semaphores(submit);
@@ -1170,6 +1228,28 @@ vn_queue_submission_do_submit(struct vn_queue_submission *submit)
 {
    VK_FROM_HANDLE(vn_queue, queue, submit->queue_handle);
    struct vn_device *dev = vn_device_from_vk(queue->base.vk.base.device);
+   VkDevice dev_handle = vn_device_to_handle(dev);
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   /* synchronize guest syncobj state with host semaphore */
+   const uint32_t wait_count = vn_get_wait_semaphore_count(submit);
+   for (uint32_t i = 0; i < wait_count; i++) {
+      VkSemaphore sem_handle = vn_get_wait_semaphore(submit, i);
+      if (!vn_semaphore_is_exported(sem_handle))
+         continue;
+      uint64_t wait_value = vn_get_wait_semaphore_counter(submit, i);
+      /* If this wait value is already pending, no need to signal again.
+       * This does not handle weird cases when semaphore is signalled both by
+       * Vulkan and externally, but once again, real apps should be fine.
+       */
+      if (wait_value >= vn_semaphore_get_last_value(sem_handle))
+         continue;
+      VkResult result = vn_submit_external_timeline_signal(
+         dev_handle, sem_handle, wait_value);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+#endif
 
    if (vn_is_batch_empty(submit))
       return VK_SUCCESS;
@@ -1223,13 +1303,13 @@ vn_queue_submission_signal_syncs(struct vn_queue_submission *submit)
    VK_FROM_HANDLE(vn_queue, queue, submit->queue_handle);
    struct vn_device *dev = vn_device_from_vk(queue->base.vk.base.device);
 
-   if (!submit->sync_count)
+   if (!submit->sig_sync_count)
       return VK_SUCCESS;
 
    struct vn_renderer_submit_batch batch = {
-      .syncs = submit->temp.syncs,
-      .sync_values = submit->temp.sync_vals,
-      .sync_count = submit->sync_count,
+      .syncs = submit->temp.sig_syncs,
+      .sync_values = submit->temp.sig_sync_vals,
+      .sync_count = submit->sig_sync_count,
       .ring_idx = queue->ring_idx,
    };
 

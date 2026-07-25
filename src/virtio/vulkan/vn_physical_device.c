@@ -1173,6 +1173,10 @@ vn_physical_device_get_native_extensions(
        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT)
       exts->KHR_external_semaphore_fd = true;
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   exts->KHR_external_semaphore_win32 = true;
+#endif
+
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
    if (physical_dev->external_memory.renderer_handle_type &&
        renderer_exts->EXT_image_drm_format_modifier &&
@@ -2994,6 +2998,13 @@ vn_GetPhysicalDeviceExternalSemaphoreProperties(
       sem_type == VK_SEMAPHORE_TYPE_BINARY
          ? physical_dev->external_binary_semaphore_handles
          : physical_dev->external_timeline_semaphore_handles;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   /* As of now, only timeline semaphores can be exported */
+   const VkExternalSemaphoreHandleTypeFlags exportable_handles =
+      sem_type == VK_SEMAPHORE_TYPE_BINARY
+         ? 0
+         : VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE_BIT;
+#endif
    if (pExternalSemaphoreInfo->handleType & valid_handles) {
       pExternalSemaphoreProperties->compatibleHandleTypes = valid_handles;
       pExternalSemaphoreProperties->exportFromImportedHandleTypes =
@@ -3001,6 +3012,14 @@ vn_GetPhysicalDeviceExternalSemaphoreProperties(
       pExternalSemaphoreProperties->externalSemaphoreFeatures =
          VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT |
          VK_EXTERNAL_SEMAPHORE_FEATURE_IMPORTABLE_BIT;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   } else if (pExternalSemaphoreInfo->handleType & exportable_handles) {
+      pExternalSemaphoreProperties->compatibleHandleTypes =
+         exportable_handles;
+      pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;
+      pExternalSemaphoreProperties->externalSemaphoreFeatures =
+         VK_EXTERNAL_SEMAPHORE_FEATURE_EXPORTABLE_BIT;
+#endif
    } else {
       pExternalSemaphoreProperties->compatibleHandleTypes = 0;
       pExternalSemaphoreProperties->exportFromImportedHandleTypes = 0;
