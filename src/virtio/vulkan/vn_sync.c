@@ -42,7 +42,7 @@ vn_sync_payload_release_internal(struct vn_device *dev,
    payload->type = VN_SYNC_TYPE_INVALID;
 }
 
-static inline void
+void
 vn_sync_payload_release(struct vn_device *dev,
                         struct vn_sync_payload *payload)
 {

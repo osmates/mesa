@@ -115,4 +115,8 @@ vn_signal_semaphore_is_sync_fd(VkSemaphore sem_handle)
 bool
 vn_semaphore_wait_sync_fd(VkDevice dev_handle, VkSemaphore sem_handle);
 
+void
+vn_sync_payload_release(struct vn_device *dev,
+                        struct vn_sync_payload *payload);
+
 #endif /* VN_SYNC_H */
