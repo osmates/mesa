@@ -26,6 +26,10 @@
 #include "vk_internal_d3dddi_ext.h"
 #endif
 
+#ifndef DRM_FORMAT_MOD_INVALID
+#define DRM_FORMAT_MOD_INVALID 0x00FFFFFFFFFFFFFF
+#endif
+
 /* device memory commands */
 
 static inline VkResult
@@ -179,6 +183,208 @@ vn_device_memory_import_handle(struct vn_device *dev,
 
    return VK_SUCCESS;
 }
+
+static VkResult
+vn_get_memory_handle_properties(
+   struct vn_device *dev,
+   bool is_kmt,
+   void *handle,
+   void *alloc_info,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out_mod,
+   VkSubresourceLayout out_layouts[VN_MAX_PLANES],
+   uint32_t *out_mem_type_bits)
+{
+   VkDevice device = vn_device_to_handle(dev);
+
+   struct vn_renderer_bo *bo;
+   VkResult result = vn_renderer_bo_create_from_handle(
+      dev->renderer, 0 /* size */, 0 /* id */, is_kmt, handle, 0 /* flags */,
+      alloc_info, &bo);
+   if (result != VK_SUCCESS) {
+      vn_log(dev->instance, "bo_create_from_handle failed");
+      return result;
+   }
+
+   if (out_mod) {
+      result =
+         vn_renderer_bo_query_info(dev->renderer, bo, out_mod, out_layouts);
+      if (result != VK_SUCCESS) {
+         vn_log(dev->instance, "bo_query_info failed");
+         vn_renderer_bo_unref(dev->renderer, bo);
+         return result;
+      }
+   }
+
+   vn_ring_roundtrip(dev->primary_ring);
+
+   VkMemoryResourcePropertiesMESA props = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA,
+   };
+   result = vn_call_vkGetMemoryResourcePropertiesMESA(
+      dev->primary_ring, device, bo->res_id, &props);
+   vn_renderer_bo_unref(dev->renderer, bo);
+   if (result != VK_SUCCESS) {
+      vn_log(dev->instance, "vkGetMemoryResourcePropertiesMESA failed");
+      return result;
+   }
+
+   *out_mem_type_bits = props.memoryTypeBits;
+
+   return VK_SUCCESS;
+}
+
+static VkResult
+vn_device_memory_import_d3d(struct vn_device *dev,
+                            struct vn_device_memory *mem,
+                            const VkMemoryAllocateInfo *alloc_info,
+                            bool is_kmt,
+                            void *handle)
+{
+   /* This all pretty much assumes Linux host */
+   VkImageDrmFormatModifierExplicitCreateInfoEXT mod_info;
+   VkSubresourceLayout layouts[VN_MAX_PLANES];
+   uint32_t mem_type_bits = 0;
+   VkResult result =
+      vn_get_memory_handle_properties(dev, is_kmt, handle, (void *)alloc_info,
+                                      &mod_info, layouts, &mem_type_bits);
+   if (result != VK_SUCCESS)
+      return result;
+
+   const VkMemoryDedicatedAllocateInfo *dedicated_info =
+      vk_find_struct_const(alloc_info->pNext, MEMORY_DEDICATED_ALLOCATE_INFO);
+
+   VkMemoryRequirements mem_reqs;
+   if (dedicated_info && dedicated_info->image != VK_NULL_HANDLE) {
+      struct vn_image *img = vn_image_from_handle(dedicated_info->image);
+      assert(img->base.vk.d3d_deferred_create_info);
+
+      VkImageCreateInfo create_info = *img->base.vk.d3d_deferred_create_info;
+
+      const void *pnext = create_info.pNext;
+      create_info.pNext = NULL;
+
+      const bool has_mod =
+         mod_info.drmFormatModifier != DRM_FORMAT_MOD_INVALID;
+
+      if (has_mod) {
+         create_info.tiling = img->base.vk.tiling =
+            VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
+         __vk_append_struct(&create_info, &mod_info);
+      }
+
+      if (has_mod && mod_info.drmFormatModifierPlaneCount == 0) {
+         VkPhysicalDevice physical_dev =
+            vn_physical_device_to_handle(dev->physical_device);
+
+         VkDrmFormatModifierPropertiesList2EXT mod_properties_list = {
+            .sType =
+               VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_2_EXT,
+            .drmFormatModifierCount = 0,
+            .pDrmFormatModifierProperties = NULL,
+         };
+
+         VkFormatProperties2 format_properties = {
+            .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2_KHR,
+            .pNext = &mod_properties_list,
+         };
+
+         vn_GetPhysicalDeviceFormatProperties2(
+            physical_dev, img->base.vk.format, &format_properties);
+
+         mod_properties_list.pDrmFormatModifierProperties =
+            calloc(sizeof(VkDrmFormatModifierProperties2EXT),
+                   mod_properties_list.drmFormatModifierCount);
+
+         vn_GetPhysicalDeviceFormatProperties2(
+            physical_dev, img->base.vk.format, &format_properties);
+         for (size_t i = 0; i < mod_properties_list.drmFormatModifierCount;
+              i++) {
+            if (mod_properties_list.pDrmFormatModifierProperties[i]
+                   .drmFormatModifier == mod_info.drmFormatModifier) {
+               mod_info.drmFormatModifierPlaneCount =
+                  mod_properties_list.pDrmFormatModifierProperties[i]
+                     .drmFormatModifierPlaneCount;
+               break;
+            }
+         }
+         free(mod_properties_list.pDrmFormatModifierProperties);
+      }
+
+      VkExternalMemoryImageCreateInfo external_info = {
+         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO,
+         .handleTypes =
+            dev->physical_device->external_memory.renderer_handle_type,
+      };
+      __vk_append_struct(&create_info, &external_info);
+      external_info.pNext = pnext;
+
+      result = vn_image_init_deferred(dev, &create_info, img);
+      if (result != VK_SUCCESS)
+         return result;
+
+      mem_reqs = img->requirements[0].memory.memoryRequirements;
+      mem_reqs.memoryTypeBits &= mem_type_bits;
+   } else
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   if (!mem_reqs.memoryTypeBits)
+      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+   if (!((1 << mem->base.vk.memory_type_index) & mem_reqs.memoryTypeBits))
+      mem->base.vk.memory_type_index = ffs(mem_reqs.memoryTypeBits) - 1;
+
+   mem->base.vk.size = mem_reqs.size;
+
+   const VkMemoryAllocateInfo local_alloc_info = {
+      .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+      .pNext = alloc_info->pNext,
+      .allocationSize = mem->base.vk.size,
+      .memoryTypeIndex = mem->base.vk.memory_type_index,
+   };
+
+   return vn_device_memory_import_handle(dev, mem, &local_alloc_info, is_kmt,
+                                         handle);
+}
+
+static inline bool
+vn_device_handle_type_supported(VkExternalMemoryHandleTypeFlagBits handleType)
+{
+   switch (handleType) {
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT:
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT:
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT:
+      return true;
+   default:
+      /* Handle type is not supported (yet?) */
+      return false;
+   }
+}
+
+static inline bool
+vn_device_handle_type_is_kmt(VkExternalMemoryHandleTypeFlagBits handleType)
+{
+   switch (handleType) {
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT:
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT:
+      return true;
+   default:
+      return false;
+   }
+}
+
+static inline bool
+vn_device_handle_type_is_d3d(VkExternalMemoryHandleTypeFlagBits handleType)
+{
+   switch (handleType) {
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT:
+   case VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT:
+      return true;
+   default:
+      return false;
+   }
+}
+
 #else
 VkResult
 vn_device_memory_import_dma_buf(struct vn_device *dev,
@@ -397,9 +603,12 @@ vn_device_memory_alloc(struct vn_device *dev,
       alloc_info = vn_device_memory_fix_alloc_info(
          alloc_info, renderer_handle_type, has_guest_vram, &local_info);
 
-      // FIXME: this is slightly wrong for Windows
+      /* Windows needs to differentiate between KMT and NT shared handles
+       * And we don't care about cross-device there */
+#ifndef VK_USE_PLATFORM_WIN32_KHR
       /* ensure correct blob flags */
       mem_vk->export_handle_types = renderer_handle_type;
+#endif
    }
 
 #ifdef VK_USE_PLATFORM_WIN32_KHR
@@ -483,20 +692,29 @@ vn_AllocateMemory(VkDevice device,
       vk_find_struct_const(pAllocateInfo->pNext,
                            IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR);
    if (import_win32_info) {
+      if (!vn_device_handle_type_supported(import_win32_info->handleType)) {
+         vk_device_memory_destroy(&dev->base.vk, pAllocator, &mem->base.vk);
+         return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+      }
       const bool is_kmt =
-         !!(import_win32_info->handleType &
-            VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT);
+         vn_device_handle_type_is_kmt(import_win32_info->handleType);
+      const bool is_d3d =
+         vn_device_handle_type_is_d3d(import_win32_info->handleType);
+
       void *handle = import_win32_info->handle;
 
       struct vn_device_memory_alloc_info local_info;
-      if (mem->base.vk.export_handle_types &&
-          mem->base.vk.export_handle_types != renderer_handle_type) {
-         pAllocateInfo = vn_device_memory_fix_alloc_info(
-            pAllocateInfo, renderer_handle_type, has_guest_vram, &local_info);
-      }
+      /* Host does not support win32 handles */
+      pAllocateInfo = vn_device_memory_fix_alloc_info(
+         pAllocateInfo, renderer_handle_type, has_guest_vram, &local_info);
 
-      result = vn_device_memory_import_handle(dev, mem, pAllocateInfo, is_kmt,
+      if (is_d3d) {
+         result = vn_device_memory_import_d3d(dev, mem, pAllocateInfo, is_kmt,
                                               handle);
+      } else {
+         result = vn_device_memory_import_handle(dev, mem, pAllocateInfo,
+                                                 is_kmt, handle);
+      }
    } else {
       result = vn_device_memory_alloc(dev, mem, pAllocateInfo);
    }
@@ -695,42 +913,6 @@ vn_GetMemoryWin32HandleKHR(
    return VK_SUCCESS;
 }
 
-static VkResult
-vn_get_memory_handle_properties(struct vn_device *dev,
-                                bool is_kmt,
-                                void *handle,
-                                void *alloc_info,
-                                uint32_t *out_mem_type_bits)
-{
-   VkDevice device = vn_device_to_handle(dev);
-
-   struct vn_renderer_bo *bo;
-   VkResult result = vn_renderer_bo_create_from_handle(
-      dev->renderer, 0 /* size */, 0 /* id */, is_kmt, handle, 0 /* flags */,
-      alloc_info, &bo);
-   if (result != VK_SUCCESS) {
-      vn_log(dev->instance, "bo_create_from_handle failed");
-      return result;
-   }
-
-   vn_ring_roundtrip(dev->primary_ring);
-
-   VkMemoryResourcePropertiesMESA props = {
-      .sType = VK_STRUCTURE_TYPE_MEMORY_RESOURCE_PROPERTIES_MESA,
-   };
-   result = vn_call_vkGetMemoryResourcePropertiesMESA(
-      dev->primary_ring, device, bo->res_id, &props);
-   vn_renderer_bo_unref(dev->renderer, bo);
-   if (result != VK_SUCCESS) {
-      vn_log(dev->instance, "vkGetMemoryResourcePropertiesMESA failed");
-      return result;
-   }
-
-   *out_mem_type_bits = props.memoryTypeBits;
-
-   return VK_SUCCESS;
-}
-
 VKAPI_ATTR VkResult VKAPI_CALL
 vn_GetMemoryWin32HandlePropertiesKHR(
    VkDevice device,
@@ -743,15 +925,14 @@ vn_GetMemoryWin32HandlePropertiesKHR(
    uint32_t mem_type_bits = 0;
    VkResult result = VK_SUCCESS;
 
-   if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT &&
-       handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT)
+   if (!vn_device_handle_type_supported(handleType))
       return vn_error(dev->instance, VK_ERROR_INVALID_EXTERNAL_HANDLE);
 
-   const bool is_kmt =
-      handleType == VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT;
+   const bool is_kmt = vn_device_handle_type_is_kmt(handleType);
 
-   result = vn_get_memory_handle_properties(
-      dev, is_kmt, handle, pMemoryWin32HandleProperties, &mem_type_bits);
+   result = vn_get_memory_handle_properties(dev, is_kmt, handle,
+                                            pMemoryWin32HandleProperties,
+                                            NULL, NULL, &mem_type_bits);
    if (result != VK_SUCCESS)
       return vn_error(dev->instance, result);
 

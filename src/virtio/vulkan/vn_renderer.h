@@ -8,6 +8,8 @@
 
 #include "vn_common.h"
 
+#include "vn_image.h"
+
 struct vn_renderer_shmem {
    struct vn_refcount refcount;
 
@@ -159,6 +161,12 @@ struct vn_renderer_bo_ops {
       VkMemoryPropertyFlags flags,
       const VkMemoryAllocateInfo *alloc_info,
       struct vn_renderer_bo **out_bo);
+
+   VkResult (*query_info)(
+      struct vn_renderer *renderer,
+      struct vn_renderer_bo *bo,
+      VkImageDrmFormatModifierExplicitCreateInfoEXT *out_mod,
+      VkSubresourceLayout out_layouts[VN_MAX_PLANES]);
 #else
    VkResult (*create_from_dma_buf)(struct vn_renderer *renderer,
                                    VkDeviceSize size,
@@ -373,6 +381,16 @@ vn_renderer_bo_create_from_handle(struct vn_renderer *renderer,
 
    *out_bo = bo;
    return VK_SUCCESS;
+}
+
+static inline VkResult
+vn_renderer_bo_query_info(
+   struct vn_renderer *renderer,
+   struct vn_renderer_bo *bo,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out_mod,
+   VkSubresourceLayout out_layouts[VN_MAX_PLANES])
+{
+   return renderer->bo_ops.query_info(renderer, bo, out_mod, out_layouts);
 }
 #else
 static inline VkResult

@@ -361,11 +361,14 @@ vn_image_init_memory_requirements(struct vn_image *img,
          },
          &img->requirements[0].memory);
 
-      /* AHB backed image requires dedicated allocation */
+      /* AHB/D3D backed image requires dedicated allocation */
       if (img->deferred) {
          img->requirements[0].dedicated.prefersDedicatedAllocation = VK_TRUE;
          img->requirements[0].dedicated.requiresDedicatedAllocation = VK_TRUE;
       }
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+      img->requirements[0].dedicated.prefersDedicatedAllocation = VK_TRUE;
+#endif
    } else {
       for (uint32_t i = 0; i < plane_count; i++) {
          vn_call_vkGetImageMemoryRequirements2(
@@ -381,6 +384,9 @@ vn_image_init_memory_requirements(struct vn_image *img,
                .image = img_handle,
             },
             &img->requirements[i].memory);
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+         img->requirements[i].dedicated.prefersDedicatedAllocation = VK_TRUE;
+#endif
       }
    }
 }
@@ -478,6 +484,143 @@ vn_image_create_deferred(struct vn_device *dev,
    return VK_SUCCESS;
 }
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+/* Adapted from vk_android_init_deferred_image */
+static VkResult
+vn_d3d_init_deferred_image(struct vn_device *device,
+                           struct vn_image *image,
+                           const VkImageCreateInfo *pCreateInfo,
+                           const VkAllocationCallbacks *pAllocator)
+{
+   /* collect all dynamic array infos */
+   uint32_t queue_family_count = 0;
+   uint32_t view_format_count = 0;
+   uint32_t fixed_rate_count = 0;
+
+   if (pCreateInfo->sharingMode == VK_SHARING_MODE_CONCURRENT)
+      queue_family_count = pCreateInfo->queueFamilyIndexCount;
+
+   const VkImageFormatListCreateInfo *raw_list =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_FORMAT_LIST_CREATE_INFO);
+   if (raw_list)
+      view_format_count = raw_list->viewFormatCount;
+
+   const VkImageCompressionControlEXT *raw_compress =
+      vk_find_struct_const(pCreateInfo->pNext, IMAGE_COMPRESSION_CONTROL_EXT);
+   if (raw_compress &&
+       (raw_compress->flags & VK_IMAGE_COMPRESSION_FIXED_RATE_EXPLICIT_EXT))
+      fixed_rate_count = raw_compress->compressionControlPlaneCount;
+
+   /* Extend below when driver support more extensions that interact with D3D */
+   VK_MULTIALLOC(ma);
+   VK_MULTIALLOC_DECL(&ma, VkImageCreateInfo, create_info, 1);
+   VK_MULTIALLOC_DECL(&ma, VkImageFormatListCreateInfo, list_info, 1);
+   VK_MULTIALLOC_DECL(&ma, VkImageStencilUsageCreateInfo, stencil_info, 1);
+   VK_MULTIALLOC_DECL(&ma, VkImageCompressionControlEXT, compress_info, 1);
+   VK_MULTIALLOC_DECL(&ma, uint32_t, queue_families, queue_family_count);
+   VK_MULTIALLOC_DECL(&ma, VkFormat, view_formats, view_format_count);
+   VK_MULTIALLOC_DECL(&ma, VkImageCompressionFixedRateFlagsEXT, fixed_rates,
+                      fixed_rate_count);
+
+   if (!vk_multialloc_zalloc2(&ma, &device->base.vk.alloc, pAllocator,
+                              VK_SYSTEM_ALLOCATION_SCOPE_OBJECT))
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   /* prepare the deferred VkImageCreateInfo chain */
+   *create_info = *pCreateInfo;
+   create_info->pNext = NULL;
+
+   create_info->format = image->base.vk.format;
+   /* We don't know whether this is VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT or
+    * VK_TILING_OPTIMAL yet. Resolve later, on memory creation/bind */
+   create_info->tiling = image->base.vk.tiling;
+   if (pCreateInfo->sharingMode == VK_SHARING_MODE_CONCURRENT) {
+      typed_memcpy(queue_families, pCreateInfo->pQueueFamilyIndices,
+                   pCreateInfo->queueFamilyIndexCount);
+      create_info->pQueueFamilyIndices = queue_families;
+   }
+
+   /* Per spec section 12.3. Images
+    *
+    * - If tiling is VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT and flags contains
+    *   VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT, then the pNext chain must include a
+    *   VkImageFormatListCreateInfo structure with non-zero viewFormatCount.
+    *
+    * D3D texture with VirtIO GPU might be
+    * VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT, so we chain a view format of the
+    * create format itself to satisfy VK_EXT_image_drm_format_modifier VUs.
+    */
+   if (view_format_count ||
+       image->base.vk.create_flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) {
+      if (view_format_count) {
+         typed_memcpy(view_formats, raw_list->pViewFormats,
+                      view_format_count);
+      } else {
+         view_format_count = 1;
+         view_formats = &create_info->format;
+      }
+      *list_info = (VkImageFormatListCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+         .viewFormatCount = view_format_count,
+         .pViewFormats = view_formats,
+      };
+      __vk_append_struct(create_info, list_info);
+   }
+
+   if (image->base.vk.stencil_usage) {
+      *stencil_info = (VkImageStencilUsageCreateInfo){
+         .sType = VK_STRUCTURE_TYPE_IMAGE_STENCIL_USAGE_CREATE_INFO,
+         .stencilUsage = image->base.vk.stencil_usage,
+      };
+      __vk_append_struct(create_info, stencil_info);
+   }
+
+   /* VK_EXT_image_compression_control */
+   if (raw_compress) {
+      if (fixed_rate_count) {
+         typed_memcpy(fixed_rates, raw_compress->pFixedRateFlags,
+                      fixed_rate_count);
+      }
+      *compress_info = (VkImageCompressionControlEXT){
+         .sType = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT,
+         .flags = raw_compress->flags,
+         .compressionControlPlaneCount = fixed_rate_count,
+         .pFixedRateFlags = fixed_rate_count ? fixed_rates : NULL,
+      };
+      __vk_append_struct(create_info, compress_info);
+   }
+
+   image->base.vk.d3d_deferred_create_info = create_info;
+
+   return VK_SUCCESS;
+}
+
+static VkResult
+vn_image_create_deferred_d3d(struct vn_device *dev,
+                             const VkImageCreateInfo *create_info,
+                             const VkAllocationCallbacks *alloc,
+                             struct vn_image **out_img)
+{
+   struct vn_image *img =
+      vk_image_create(&dev->base.vk, create_info, alloc, sizeof(*img));
+   if (!img)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+   vn_object_set_id(img, vn_get_next_obj_id(), VK_OBJECT_TYPE_IMAGE);
+
+   VkResult result = vn_d3d_init_deferred_image(dev, img, create_info, alloc);
+   if (result != VK_SUCCESS) {
+      vk_image_destroy(&dev->base.vk, alloc, &img->base.vk);
+      return result;
+   }
+
+   img->deferred = true;
+   *out_img = img;
+
+   return VK_SUCCESS;
+}
+#endif
+
 struct vn_image_create_info {
    VkImageCreateInfo create;
    VkExternalMemoryImageCreateInfo external;
@@ -557,6 +700,7 @@ vn_CreateImage(VkDevice device,
    const VkImageSwapchainCreateInfoKHR *swapchain_info = NULL;
    const VkExternalMemoryImageCreateInfo *external_info = NULL;
    bool ahb_info = false;
+   bool d3d_info = false;
 
    vk_foreach_struct_const(sType, pnext, pCreateInfo->pNext) {
       switch ((uint32_t)sType) {
@@ -579,6 +723,12 @@ vn_CreateImage(VkDevice device,
             external_info->handleTypes ==
             VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID)
             ahb_info = true;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+         else if (external_info->handleTypes &
+                  (VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT |
+                   VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT))
+            d3d_info = true;
+#endif
          break;
       default:
          break;
@@ -596,12 +746,16 @@ vn_CreateImage(VkDevice device,
     *
     * Will have to fix more when renderer handle type is no longer dma_buf.
     */
-   if (wsi_info) {
+   if (wsi_info && !d3d_info) {
       result = vn_wsi_create_image(dev, pCreateInfo, wsi_info, alloc, &img);
    } else if (anb_info) {
       result = vn_android_image_from_anb(dev, pCreateInfo, alloc, &img);
    } else if (ahb_info) {
       result = vn_image_create_deferred(dev, pCreateInfo, alloc, &img);
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   } else if (d3d_info) {
+      result = vn_image_create_deferred_d3d(dev, pCreateInfo, alloc, &img);
+#endif
    } else if (swapchain_info) {
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
       result = vn_image_create_deferred(dev, pCreateInfo, alloc, &img);
@@ -664,6 +818,10 @@ vn_GetImageMemoryRequirements2(VkDevice device,
       plane = vn_image_get_plane(plane_info->planeAspect);
 
    vn_image_fill_reqs(&img->requirements[plane], pMemoryRequirements);
+
+   if (pMemoryRequirements->memoryRequirements.memoryTypeBits == 0) {
+      pMemoryRequirements->memoryRequirements.memoryTypeBits = UINT32_MAX;
+   }
 }
 
 VKAPI_ATTR void VKAPI_CALL
