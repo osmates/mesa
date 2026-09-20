@@ -193,6 +193,15 @@ vk_image_destroy(struct vk_device *device,
    }
    vk_free2(&device->alloc, alloc, image->android_deferred_create_info);
 #endif
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   if (image->d3d_memory) {
+      device->dispatch_table.FreeMemory(
+         (VkDevice)device, image->d3d_memory, alloc);
+   }
+   vk_free2(&device->alloc, alloc, image->d3d_deferred_create_info);
+#endif
+
    vk_object_free(device, alloc, image);
 }
 

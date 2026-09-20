@@ -110,6 +110,15 @@ struct vk_image {
     */
    VkImageCreateInfo *android_deferred_create_info;
 #endif
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   VkDeviceMemory d3d_memory;
+   /* Deep-copied and sanitized VkImageCreateInfo for deferred D3D11/12 alias
+    * images. Set by ICD and freed automatically by vk_image_destroy().
+    * NULL for non-deferred images.
+    */
+   VkImageCreateInfo *d3d_deferred_create_info;
+#endif
 };
 VK_DEFINE_NONDISP_HANDLE_CASTS(vk_image, base, VkImage,
                                VK_OBJECT_TYPE_IMAGE);
