@@ -36,6 +36,8 @@
 #include "wsi_common_entrypoints.h"
 #include "wsi_common_private.h"
 
+#include <strsafe.h>
+
 #include <dxgi1_4.h>
 #include <directx/d3d12.h>
 #include <dxguids/dxguids.h>
@@ -928,6 +930,16 @@ wsi_win32_surface_create_swapchain_dxgi(
    return VK_SUCCESS;
 }
 
+static HMODULE
+load_system_library(const wchar_t *name)
+{
+    wchar_t system_path[MAX_PATH] = L"";
+    GetSystemDirectoryW(system_path, MAX_PATH);
+    StringCchCatW(system_path, MAX_PATH, L"\\");
+    StringCchCatW(system_path, MAX_PATH, name);
+    return LoadLibraryW(system_path);
+}
+
 static VkResult
 wsi_win32_surface_create_swapchain(
    VkIcdSurfaceBase *icd_surface,
@@ -1039,7 +1051,7 @@ fail:
 static IDXGIFactory4 *
 dxgi_get_factory(bool debug)
 {
-   HMODULE dxgi_mod = LoadLibraryA("DXGI.DLL");
+   HMODULE dxgi_mod = load_system_library(L"DXGI.DLL");
    if (!dxgi_mod) {
       return NULL;
    }
@@ -1068,7 +1080,7 @@ dxgi_get_factory(bool debug)
 static IDCompositionDevice *
 dcomp_get_device()
 {
-   HMODULE dcomp_mod = LoadLibraryA("DComp.DLL");
+   HMODULE dcomp_mod = load_system_library(L"DComp.DLL");
    if (!dcomp_mod) {
       return NULL;
    }
