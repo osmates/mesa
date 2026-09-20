@@ -138,8 +138,9 @@ vn_wsi_init(struct vn_physical_device *physical_dev)
 {
    const bool use_sw_device =
       physical_dev->instance->renderer->info.needs_sw_wsi ||
-      !physical_dev->base.vk.supported_extensions
-          .EXT_external_memory_dma_buf ||
+      (!physical_dev->base.vk.supported_extensions
+           .EXT_external_memory_dma_buf &&
+       !physical_dev->base.vk.supported_extensions.KHR_external_memory_win32) ||
       (physical_dev->renderer_driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
        physical_dev->renderer_driver_version <
           VN_MAKE_NVIDIA_VERSION(590, 48, 1, 0));
@@ -967,6 +968,8 @@ vn_AcquireNextImage2KHR(VkDevice device,
       return vn_error(dev->instance, result);
 
 #ifdef VK_USE_PLATFORM_WIN32_KHR
+   /* TODO: we need to do something more clever instead of a CPU wait in
+    * wsi_win32_acquire_next_image */
    if (pAcquireInfo->semaphore != VK_NULL_HANDLE) {
       struct vn_semaphore *sem =
          vn_semaphore_from_handle(pAcquireInfo->semaphore);
