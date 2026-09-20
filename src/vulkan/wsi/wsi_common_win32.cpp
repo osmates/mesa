@@ -39,6 +39,7 @@
 #include <strsafe.h>
 
 #include <dxgi1_4.h>
+#include <d3d11.h>
 #include <directx/d3d12.h>
 #include <dxguids/dxguids.h>
 
@@ -61,6 +62,10 @@ struct wsi_win32 {
       IDXGIFactory4 *factory;
       IDCompositionDevice *dcomp;
    } dxgi;
+   struct {
+      ID3D11Device *device;
+      ID3D11DeviceContext *context;
+   } d3d11;
 };
 
 enum wsi_win32_image_state {
@@ -75,6 +80,8 @@ struct wsi_win32_image {
    struct wsi_win32_swapchain *chain;
    struct {
       ID3D12Resource *swapchain_res;
+      ID3D11Texture2D *swapchain_tex;
+      ID3D11Texture2D *blit_tex;
    } dxgi;
    struct {
       HDC dc;
@@ -187,7 +194,9 @@ wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
 
    caps->surfaceCapabilities.minImageCount = 1;
 
-   if (!wsi_device->sw && wsi_device->win32.get_d3d12_command_queue) {
+   VK_FROM_HANDLE(vk_physical_device, pdevice, wsi_device->pdevice);
+   if (!wsi_device->sw && (wsi_device->win32.get_d3d12_command_queue ||
+                           pdevice->properties.deviceLUIDValid)) {
       /* DXGI doesn't support random presenting order (images need to
        * be presented in the order they were acquired), so we can't
        * expose more than two image per swapchain.
@@ -195,7 +204,7 @@ wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
       caps->surfaceCapabilities.minImageCount = caps->surfaceCapabilities.maxImageCount = 2;
    } else {
       caps->surfaceCapabilities.minImageCount = 1;
-      /* Software callbacke, there is no real maximum */
+      /* Software fallbacks, there is no real maximum */
       caps->surfaceCapabilities.maxImageCount = 0;
    }
 
@@ -220,7 +229,6 @@ wsi_win32_surface_get_capabilities(VkIcdSurfaceBase *surf,
 
    VkImageUsageFlags image_usage = wsi_caps_get_image_usage();
 
-   VK_FROM_HANDLE(vk_physical_device, pdevice, wsi_device->pdevice);
    if (pdevice->supported_extensions.EXT_attachment_feedback_loop_layout)
       image_usage |= VK_IMAGE_USAGE_ATTACHMENT_FEEDBACK_LOOP_BIT_EXT;
 
@@ -419,7 +427,10 @@ wsi_win32_surface_get_present_modes(VkIcdSurfaceBase *surface,
 {
    const VkPresentModeKHR *array;
    size_t array_size;
-   if (wsi_device->sw || !wsi_device->win32.get_d3d12_command_queue) {
+
+   VK_FROM_HANDLE(vk_physical_device, pdevice, wsi_device->pdevice);
+   if (wsi_device->sw || (!wsi_device->win32.get_d3d12_command_queue &&
+                          !pdevice->properties.deviceLUIDValid)) {
       array = present_modes_gdi;
       array_size = ARRAY_SIZE(present_modes_gdi);
    } else {
@@ -475,8 +486,56 @@ wsi_create_dxgi_image_mem(const struct wsi_swapchain *drv_chain,
    uint32_t image_idx =
       ((uintptr_t)win32_image - (uintptr_t)chain->images) /
       sizeof(*win32_image);
-   if (FAILED(chain->dxgi->GetBuffer(image_idx,
-                                     IID_PPV_ARGS(&win32_image->dxgi.swapchain_res))))
+   if (chain->wsi->d3d11.device) {
+      if (FAILED(chain->dxgi->GetBuffer(image_idx,
+                                        IID_PPV_ARGS(&win32_image->dxgi.swapchain_tex))))
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+      D3D11_TEXTURE2D_DESC desc;
+      win32_image->dxgi.swapchain_tex->GetDesc(&desc);
+      desc.MiscFlags |= D3D11_RESOURCE_MISC_SHARED;
+
+      if (FAILED(chain->wsi->d3d11.device->CreateTexture2D(&desc, NULL,
+                                                           &win32_image->dxgi.blit_tex)))
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+      IDXGIResource *dxgi_res;
+      if (FAILED(win32_image->dxgi.blit_tex->QueryInterface(&dxgi_res)))
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+
+      HANDLE handle;
+      if (FAILED(dxgi_res->GetSharedHandle(&handle))) {
+         dxgi_res->Release();
+         return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      }
+      dxgi_res->Release();
+
+      VkMemoryRequirements reqs;
+      wsi->GetImageMemoryRequirements(chain->base.device, image->image, &reqs);
+
+      VkImportMemoryWin32HandleInfoKHR memory_win32_handle_info = {
+         VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR,
+         nullptr,
+         VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT,
+         handle,
+      };
+      const VkMemoryDedicatedAllocateInfo memory_dedicated_info = {
+         VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO,
+         &memory_win32_handle_info,
+         image->image,
+         VK_NULL_HANDLE,
+      };
+      const VkMemoryAllocateInfo memory_info = {
+         VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+         &memory_dedicated_info,
+         reqs.size,
+         wsi_select_device_memory_type(wsi, reqs.memoryTypeBits),
+      };
+
+      return wsi->AllocateMemory(chain->base.device, &memory_info,
+                                 &chain->base.alloc, &image->memory);
+   } else if (FAILED(chain->dxgi->GetBuffer(image_idx,
+                                            IID_PPV_ARGS(&win32_image->dxgi.swapchain_res))))
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
 
    VkResult result =
@@ -539,20 +598,27 @@ wsi_dxgi_image_needs_blit(const struct wsi_device *wsi,
 }
 
 VkResult
-wsi_dxgi_configure_image(const struct wsi_swapchain *chain,
+wsi_dxgi_configure_image(const struct wsi_swapchain *drv_chain,
                          const VkSwapchainCreateInfoKHR *pCreateInfo,
                          const struct wsi_dxgi_image_params *params,
                          struct wsi_image_info *info)
 {
+   VkExternalMemoryHandleTypeFlags handle_types = 0;
+   struct wsi_win32_swapchain *chain =
+      (struct wsi_win32_swapchain *) drv_chain;
+   if (chain->wsi->d3d11.device) {
+      handle_types |= VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_KMT_BIT;
+   }
+
    VkResult result =
-      wsi_configure_image(chain, pCreateInfo, 0, info);
+      wsi_configure_image(drv_chain, pCreateInfo, handle_types, info);
    if (result != VK_SUCCESS)
       return result;
 
    info->create_mem = wsi_create_dxgi_image_mem;
 
-   if (chain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
-      wsi_configure_image_blit_image(chain, info);
+   if (drv_chain->blit.type != WSI_SWAPCHAIN_NO_BLIT) {
+      wsi_configure_image_blit_image(drv_chain, info);
       info->select_image_memory_type = wsi_select_device_memory_type;
       info->select_blit_dst_memory_type = wsi_select_device_memory_type;
    }
@@ -612,7 +678,10 @@ wsi_win32_image_finish(struct wsi_win32_swapchain *chain,
 {
    if (image->dxgi.swapchain_res)
       image->dxgi.swapchain_res->Release();
-
+   if (image->dxgi.swapchain_tex)
+      image->dxgi.swapchain_tex->Release();
+   if (image->dxgi.blit_tex)
+      image->dxgi.blit_tex->Release();
    if (image->sw.dc)
       DeleteDC(image->sw.dc);
    if(image->sw.bmp)
@@ -799,6 +868,10 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
       rects,
    };
 
+   if (image->dxgi.blit_tex) {
+      image->chain->wsi->d3d11.context->CopyResource(image->dxgi.swapchain_tex, image->dxgi.blit_tex);
+   }
+
    image->state = WSI_IMAGE_QUEUED;
    UINT sync_interval = chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR ? 1 : 0;
    UINT present_flags = chain->base.present_mode == VK_PRESENT_MODE_IMMEDIATE_KHR ?
@@ -865,8 +938,15 @@ wsi_win32_surface_create_swapchain_dxgi(
    struct wsi_win32_swapchain *chain)
 {
    IDXGIFactory4 *factory = wsi->dxgi.factory;
-   ID3D12CommandQueue *queue =
-      (ID3D12CommandQueue *)wsi->wsi->win32.get_d3d12_command_queue(device);
+
+   VK_FROM_HANDLE(vk_physical_device, pdevice, wsi->physical_device);
+   IUnknown *d3d_device = NULL;
+   if (wsi->wsi->win32.get_d3d12_command_queue) {
+      d3d_device = (ID3D12CommandQueue *)
+         wsi->wsi->win32.get_d3d12_command_queue(device);
+   } else if (pdevice->properties.deviceLUIDValid) {
+      d3d_device = wsi->d3d11.device;
+   }
 
    DXGI_ALPHA_MODE alpha_mode;
    switch (create_info->compositeAlpha) {
@@ -908,7 +988,7 @@ wsi_win32_surface_create_swapchain_dxgi(
       desc.BufferUsage |= DXGI_USAGE_RENDER_TARGET_OUTPUT;
 
    IDXGISwapChain1 *swapchain1;
-   if (FAILED(factory->CreateSwapChainForComposition(queue, &desc, NULL, &swapchain1)) ||
+   if (FAILED(factory->CreateSwapChainForComposition(d3d_device, &desc, NULL, &swapchain1)) ||
        FAILED(swapchain1->QueryInterface(&chain->dxgi)))
       return VK_ERROR_INITIALIZATION_FAILED;
 
@@ -940,6 +1020,51 @@ load_system_library(const wchar_t *name)
     return LoadLibraryW(system_path);
 }
 
+static bool
+d3d11_init_device_and_context(struct wsi_win32 *wsi, bool debug)
+{
+   VK_FROM_HANDLE(vk_physical_device, pdevice, wsi->physical_device);
+   if (!pdevice->properties.deviceLUIDValid) {
+      return false;
+   }
+
+   HMODULE d3d11_mod = load_system_library(L"D3D11.DLL");
+   if (!d3d11_mod) {
+      return false;
+   }
+
+   typedef HRESULT (STDAPICALLTYPE *PFN_D3D11_CREATE_DEVICE)(IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL *, UINT, UINT, ID3D11Device **, D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
+   PFN_D3D11_CREATE_DEVICE D3D11CreateDevice;
+
+   D3D11CreateDevice = (PFN_D3D11_CREATE_DEVICE)GetProcAddress(d3d11_mod, "D3D11CreateDevice");
+   if (!D3D11CreateDevice) {
+      return NULL;
+   }
+
+   LUID adapter_luid;
+   static_assert(sizeof(adapter_luid) == VK_LUID_SIZE);
+   memcpy(&adapter_luid, pdevice->properties.deviceLUID, VK_LUID_SIZE);
+
+   IDXGIAdapter *adapter = NULL;
+   HRESULT hr = wsi->dxgi.factory->EnumAdapterByLuid(adapter_luid,
+                                                     IID_PPV_ARGS(&adapter));
+   if (FAILED(hr)) {
+      return false;
+   }
+
+   UINT flags = 0;
+   if (debug)
+      flags |= D3D11_CREATE_DEVICE_DEBUG;
+
+   hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, flags, NULL, 0, D3D11_SDK_VERSION, &wsi->d3d11.device, NULL, &wsi->d3d11.context);
+   adapter->Release();
+   if (FAILED(hr)) {
+      return false;
+   }
+
+   return true;
+}
+
 static VkResult
 wsi_win32_surface_create_swapchain(
    VkIcdSurfaceBase *icd_surface,
@@ -964,6 +1089,7 @@ wsi_win32_surface_create_swapchain(
 
    if (chain == NULL)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
+   chain->wsi = wsi;
 
    int ret = mtx_init(&chain->acquire_mutex, mtx_plain);
    if (ret != thrd_success) {
@@ -989,9 +1115,24 @@ wsi_win32_surface_create_swapchain(
       { WSI_IMAGE_TYPE_CPU },
    };
 
+   VK_FROM_HANDLE(vk_physical_device, pdevice, wsi->physical_device);
    bool supports_dxgi = wsi->dxgi.factory &&
                         wsi->dxgi.dcomp &&
-                        wsi->wsi->win32.get_d3d12_command_queue;
+                        (wsi->wsi->win32.get_d3d12_command_queue ||
+                        pdevice->properties.deviceLUIDValid);
+
+   if (supports_dxgi && !wsi->wsi->win32.get_d3d12_command_queue) {
+      if (!d3d11_init_device_and_context(wsi, WSI_DEBUG & WSI_DEBUG_DXGI)) {
+         mtx_destroy(&chain->acquire_mutex);
+         vk_free(allocator, chain);
+         return VK_ERROR_OUT_OF_HOST_MEMORY;
+      }
+      /* We always have to do D3D11 blit because we cannot import non-shared DXGI
+       * swapchain textures, but common wsi assumes Vulkan would perform the blit
+       */
+      dxgi_image_params.storage_image = false;
+   }
+
    struct wsi_base_image_params *image_params = supports_dxgi ?
       &dxgi_image_params.base : &cpu_image_params.base;
 
@@ -1013,7 +1154,6 @@ wsi_win32_surface_create_swapchain(
    chain->base.present_mode = wsi_swapchain_get_present_mode(wsi_device, create_info);
    chain->extent = create_info->imageExtent;
 
-   chain->wsi = wsi;
    chain->status = VK_SUCCESS;
 
    chain->surface = surface;
@@ -1168,6 +1308,10 @@ wsi_win32_finish_wsi(struct wsi_device *wsi_device,
       wsi->dxgi.factory->Release();
    if (wsi->dxgi.dcomp)
       wsi->dxgi.dcomp->Release();
+   if (wsi->d3d11.device)
+      wsi->d3d11.device->Release();
+   if (wsi->d3d11.context)
+      wsi->d3d11.context->Release();
 
    vk_free(alloc, wsi);
 }
