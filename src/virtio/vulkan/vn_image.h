@@ -13,6 +13,8 @@
 
 #include "vn_common.h"
 
+#define VN_MAX_PLANES 4
+
 /* changing this to VK_IMAGE_LAYOUT_PRESENT_SRC_KHR disables ownership
  * transfers and can be useful for debugging
  */

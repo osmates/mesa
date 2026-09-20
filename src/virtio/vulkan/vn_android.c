@@ -21,8 +21,6 @@
 #include "vn_device_memory.h"
 #include "vn_image.h"
 
-#define VN_MAX_PLANES 4
-
 static int
 vn_android_gralloc_get_dma_buf_fd(const native_handle_t *handle)
 {
