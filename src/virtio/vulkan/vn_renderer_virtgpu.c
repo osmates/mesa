@@ -896,6 +896,7 @@ virtgpu_init_renderer_info(struct virtgpu *gpu)
       !VN_PERF(NO_TIMELINE_SYNC) && !!gpu->sync->timeline_signal;
 
    info->has_implicit_fencing = false;
+   info->needs_sw_wsi = false;
 
    const struct virgl_renderer_capset_venus *capset = &gpu->capset.data;
    info->wire_format_version = capset->wire_format_version;

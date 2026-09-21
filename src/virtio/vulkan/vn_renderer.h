@@ -69,6 +69,7 @@ struct vn_renderer_info {
    bool has_timeline_sync;
    bool has_implicit_fencing;
    bool has_guest_vram;
+   bool needs_sw_wsi;
 
    uint32_t max_timeline_count;
 

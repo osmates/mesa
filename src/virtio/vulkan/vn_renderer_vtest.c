@@ -890,6 +890,7 @@ vtest_init_renderer_info(struct vtest *vtest)
    info->has_external_sync = false;
    info->has_timeline_sync = !VN_PERF(NO_TIMELINE_SYNC);
    info->has_implicit_fencing = false;
+   info->needs_sw_wsi = false;
 
    const struct virgl_renderer_capset_venus *capset = &vtest->capset.data;
    info->wire_format_version = capset->wire_format_version;

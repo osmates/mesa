@@ -132,6 +132,7 @@ VkResult
 vn_wsi_init(struct vn_physical_device *physical_dev)
 {
    const bool use_sw_device =
+      physical_dev->instance->renderer->info.needs_sw_wsi ||
       !physical_dev->base.vk.supported_extensions
           .EXT_external_memory_dma_buf ||
       (physical_dev->renderer_driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY &&
