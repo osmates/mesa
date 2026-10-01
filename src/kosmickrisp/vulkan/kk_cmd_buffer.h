@@ -93,6 +93,9 @@ struct kk_per_draw_data {
 
    /* Whether the last vertex of a primitive is its provoking vertex */
    uint32_t provoking_last;
+
+   /* GS stream selected for rasterization */
+   uint32_t rasterization_stream;
 };
 
 struct kk_attachment {
