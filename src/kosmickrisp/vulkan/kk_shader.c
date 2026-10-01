@@ -103,6 +103,8 @@ has_static_depth_stencil_state(const struct vk_graphics_pipeline_state *state)
 
 struct kk_vs_key {
    bool is_points;
+   /* Topology class, which picks the passthrough GS input */
+   enum mesa_prim reduced_prim;
    struct vk_vertex_input_state vi;
 };
 
@@ -113,6 +115,8 @@ kk_populate_vs_key(struct kk_vs_key *key,
    memset(key, 0, sizeof(*key));
    key->is_points =
       (state->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
+   key->reduced_prim =
+      u_reduced_prim(vk_topology_to_mesa(state->ia->primitive_topology));
    key->vi = *state->vi;
 }
 
@@ -854,6 +858,8 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
          mtl_release(pipe->gfx.gs_count);
       if (pipe->gfx.pre_gs)
          mtl_release(pipe->gfx.pre_gs);
+      if (pipe->gfx.render_adjacency)
+         mtl_release(pipe->gfx.render_adjacency);
 
       /* Graphics pipeline. */
       mtl_release(pipe->gfx.render);
@@ -883,6 +889,8 @@ kk_shader_destroy(struct vk_device *vk_dev, struct kk_shader *shader,
    ralloc_free((void *)shader->gs_count.code);
    ralloc_free((void *)shader->pre_gs.entrypoint_name);
    ralloc_free((void *)shader->pre_gs.code);
+   ralloc_free((void *)shader->gs_rast_adjacency.entrypoint_name);
+   ralloc_free((void *)shader->gs_rast_adjacency.code);
 
    vk_shader_free(&dev->vk, pAllocator, &shader->vk);
 }
@@ -1503,7 +1511,9 @@ gather_graphics_pipeline_create_info(
          kk_msl_copy(&vs->gs_main, &s->gs_main);
          kk_msl_copy(&vs->gs_count, &s->gs_count);
          kk_msl_copy(&vs->pre_gs, &s->pre_gs);
+         kk_msl_copy(&vs->gs_rast_adjacency, &s->gs_rast_adjacency);
          info->vs.gs = s->info.gs;
+         info->vs.gs_adjacency = s->gs_rast_adjacency.code != NULL;
          gs = s;
       }
    }
@@ -1542,11 +1552,14 @@ gather_graphics_pipeline_create_info(
       vk_primitive_topology_to_mtl_primitive_topology_class(topology);
 }
 
+static VkResult kk_compile_render_pipeline(struct kk_device *device,
+                                           struct kk_shader *vs,
+                                           const struct msl_compile_data *vs_data,
+                                           mtl_render_pipeline_state **out);
+
 static VkResult
 kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
 {
-   struct kk_physical_device *pdev = kk_device_physical(device);
-
    VkResult result = VK_SUCCESS;
    struct kk_pipeline_handles *pipe = &vs->pipeline;
    mesa_shader_stage vs_stage = MESA_SHADER_VERTEX;
@@ -1595,7 +1608,30 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
       }
    }
 
-   const struct msl_compile_data *vs_data = &vs->msl_data[vs_stage];
+   result = kk_compile_render_pipeline(device, vs, &vs->msl_data[vs_stage],
+                                       &pipe->gfx.render);
+   if (result != VK_SUCCESS)
+      return result;
+
+   if (vs->gs_rast_adjacency.code) {
+      result = kk_compile_render_pipeline(device, vs, &vs->gs_rast_adjacency,
+                                          &pipe->gfx.render_adjacency);
+   }
+
+   return result;
+}
+
+/* The Metal render pipeline of vs_data, a rasterization VS of the pipeline
+ * vs describes, with its fragment shader */
+static VkResult
+kk_compile_render_pipeline(struct kk_device *device, struct kk_shader *vs,
+                           const struct msl_compile_data *vs_data,
+                           mtl_render_pipeline_state **out)
+{
+   struct kk_physical_device *pdev = kk_device_physical(device);
+   struct kk_pipeline_handles *pipe = &vs->pipeline;
+   VkResult result = VK_SUCCESS;
+
    mtl_library *vertex_library = mtl_new_library(
       device->mtl_compiler_handle, vs_data->code, pdev->info.msl_version,
       MTL_MATH_MODE_FAST, MTL_MATH_FLOATING_POINT_FUNCTIONS_FAST);
@@ -1639,7 +1675,7 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
             pipeline_descriptor, i, vs->info.vs.rt_formats[i]);
    }
 
-   if (vs->info.vs.has_ds) {
+   if (vs->info.vs.has_ds && !pipe->gfx.ds_handle) {
       pipe->gfx.ds_handle = kk_compile_ds_state(device, &vs->info);
    }
 
@@ -1654,9 +1690,9 @@ kk_compile_graphics_pipeline(struct kk_device *device, struct kk_shader *vs)
          pipeline_descriptor, vs->info.vs.sample_count);
    }
 
-   pipe->gfx.render =
+   *out =
       mtl_new_render_pipeline(device->mtl_compiler_handle, pipeline_descriptor);
-   if (pipe->gfx.render == NULL)
+   if (*out == NULL)
       result = VK_ERROR_INVALID_SHADER_NV;
 
    mtl_release(pipeline_descriptor);
@@ -1728,6 +1764,146 @@ kk_forward_gs_primitive_id(nir_shader *gs, nir_shader *fs)
    gs->info.outputs_written |= BITFIELD64_BIT(slot);
 }
 
+static bool
+gather_output_type(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   nir_alu_type *types = data;
+   if (intr->intrinsic != nir_intrinsic_store_output)
+      return false;
+
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   for (unsigned i = 0; i < sem.num_slots; ++i)
+      types[sem.location + i] = nir_intrinsic_src_type(intr);
+   return false;
+}
+
+/* Add a passthrough GS so poly can capture the last stage's outputs.
+ * prim is the point, line or triangle list it takes as input. */
+static nir_shader *
+kk_xfb_passthrough_gs(const nir_shader *last, enum mesa_prim prim)
+{
+   uint16_t xfb_outputs = last->xfb_info->output_count;
+   struct poly_passthrough_gs_key *key =
+      calloc(1, poly_passthrough_gs_key_size(xfb_outputs));
+
+   key->prim = prim;
+   key->outputs = last->info.outputs_written;
+   key->clip_distance_array_size = last->info.clip_distance_array_size;
+   key->cull_distance_array_size = last->info.cull_distance_array_size;
+
+   for (uint32_t i = 0; i < NUM_TOTAL_VARYING_SLOTS; i++) {
+      unsigned num_comps = 0;
+      switch (i) {
+      case VARYING_SLOT_TESS_LEVEL_OUTER:
+      case VARYING_SLOT_TESS_LEVEL_INNER:
+      case VARYING_SLOT_BOUNDING_BOX1:
+         num_comps = 4;
+         break;
+      default:
+         num_comps = nir_slot_num_components(i, MESA_SHADER_VERTEX);
+         break;
+      }
+      key->output_components[i] = num_comps ?: 4;
+      key->output_types[i] = nir_type_float32;
+   }
+
+   /* Keep the stored types for the Metal vertex/fragment interface. */
+   nir_shader_intrinsics_pass((nir_shader *)last, gather_output_type,
+                              nir_metadata_all, key->output_types);
+
+   memcpy(key->xfb_stride, last->info.xfb_stride, sizeof(key->xfb_stride));
+   memcpy(&key->xfb_info, last->xfb_info, nir_xfb_info_size(xfb_outputs));
+
+   nir_builder b = nir_builder_init_simple_shader(
+      MESA_SHADER_GEOMETRY, last->options, "xfb passthrough");
+   poly_nir_passthrough_gs(&b, key);
+   free(key);
+
+   nir_shader *gs = b.shader;
+   gs->info.io_lowered = true;
+   gs->info.next_stage = MESA_SHADER_FRAGMENT;
+   nir_shader_gather_info(gs, b.impl);
+   return gs;
+}
+
+struct adjacency_vertex {
+   unsigned start, step;
+};
+
+static bool
+rewrite_adjacency_vertex(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const struct adjacency_vertex *v = data;
+   if (intr->intrinsic != nir_intrinsic_load_per_vertex_input)
+      return false;
+
+   /* The passthrough GS reads each vertex of its input by constant index */
+   unsigned vertex = nir_src_as_uint(intr->src[0]);
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_src_rewrite(&intr->src[0], nir_imm_int(b, v->start + vertex * v->step));
+   return true;
+}
+
+/* The passthrough GS variant taking the class's adjacency primitive, built
+ * from the linked list variant so both read the same inputs. Its input
+ * assembly handles strips, as for an application GS. */
+static nir_shader *
+kk_xfb_passthrough_gs_adjacency(const nir_shader *gs)
+{
+   enum mesa_prim prim = gs->info.gs.input_primitive == MESA_PRIM_LINES
+                            ? MESA_PRIM_LINES_ADJACENCY
+                            : MESA_PRIM_TRIANGLES_ADJACENCY;
+   assert(u_reduced_prim(prim) == gs->info.gs.input_primitive);
+
+   nir_shader *adj = nir_shader_clone(NULL, gs);
+   adj->info.gs.input_primitive = prim;
+   adj->info.gs.vertices_in = mesa_vertices_per_prim(prim);
+
+   /* The same vertex selection as poly_nir_passthrough_gs */
+   struct adjacency_vertex v = {
+      .start = prim == MESA_PRIM_LINES_ADJACENCY ? 1 : 0,
+      .step = prim == MESA_PRIM_TRIANGLES_ADJACENCY ? 2 : 1,
+   };
+   nir_shader_intrinsics_pass(adj, rewrite_adjacency_vertex,
+                              nir_metadata_control_flow, &v);
+   return adj;
+}
+
+/* Compile the adjacency variant's rasterization VS, which reads the input
+ * vertices and captures them. The variant's output matches the list
+ * variant's, and a passthrough's compute pass reads no inputs, so the compute
+ * pass, count and pre-GS programs are shared. Consumes nir. */
+static void
+kk_compile_gs_adjacency(struct kk_physical_device *pdev, nir_shader *nir,
+                        const struct vk_pipeline_robustness_state *robustness,
+                        const struct vk_graphics_pipeline_state *state,
+                        struct kk_shader *shader)
+{
+   NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_in, NULL, NULL);
+
+   struct poly_gs_info info;
+   nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
+   NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs, &info);
+   ralloc_free(count);
+   ralloc_free(pre_gs);
+
+   assert(info.mode == shader->info.gs.mode &&
+          info.shape == shader->info.gs.shape &&
+          info.max_indices == shader->info.gs.max_indices &&
+          info.count_words == shader->info.gs.count_words &&
+          info.xfb == shader->info.gs.xfb &&
+          info.prefix_sum == shader->info.gs.prefix_sum);
+
+   ralloc_free(nir);
+
+   /* As for the GS in kk_compile_shader */
+   NIR_PASS(_, rast, nir_lower_global_vars_to_local);
+   kk_lower_hw_vs(rast, state, info.mode == MESA_PRIM_POINTS);
+   msl_nir_lower_clip_cull_distance(rast, 0);
+   NIR_PASS(_, rast, kk_nir_lower_descriptors, robustness, 0, NULL);
+   kk_compile_msl(pdev, rast, state, &shader->gs_rast_adjacency, false);
+}
+
 static VkResult
 kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
                    struct vk_shader_compile_info *infos,
@@ -1742,22 +1918,36 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
 
    enum kk_feature_key features = kk_make_feature_key(enabled_features, pdev);
 
-   /* Vulkan doesn't enforce a fragment shader to build pipelines. We may need
-    * to create one. */
-   nir_shader *nir_shaders[shader_count + 1u];
-   struct kk_shader *shaders[shader_count + 1u];
+   /* Leave room for a generated fragment shader and an XFB passthrough GS. */
+   nir_shader *nir_shaders[shader_count + 2u];
+   struct kk_shader *shaders[shader_count + 2u];
+   bool generated[shader_count + 2u];
+
+   /* Capture the last pre-rasterization stage, adding a passthrough GS if
+    * the application doesn't have one. */
+   uint32_t last_vtg = 0u;
+   for (uint32_t i = 0u; i < shader_count; ++i) {
+      if (infos[i].stage == MESA_SHADER_VERTEX ||
+          infos[i].stage == MESA_SHADER_TESS_EVAL ||
+          infos[i].stage == MESA_SHADER_GEOMETRY)
+         last_vtg = i;
+   }
+   bool xfb_gs = state && infos[last_vtg].nir->xfb_info &&
+                 infos[last_vtg].stage != MESA_SHADER_GEOMETRY;
 
    /* Lower shaders, notably lowering IO. This is a prerequisite for intershader
     * optimization. */
    const struct vk_pipeline_robustness_state *vertex_robustness = &rs_none;
+   uint32_t total_shaders = 0u;
    for (uint32_t i = 0u; i < shader_count; ++i) {
       const struct vk_shader_compile_info *info = &infos[i];
       nir_shader *nir = info->nir;
 
       /* Stages before the tessellator or a GS run as compute */
       bool emulated_stage =
-         info->next_stage_mask & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
-                                  VK_SHADER_STAGE_GEOMETRY_BIT);
+         (info->next_stage_mask & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
+                                   VK_SHADER_STAGE_GEOMETRY_BIT)) ||
+         (xfb_gs && i == last_vtg);
 
       msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
       kk_lower_nir(dev, nir, emulated_stage, info->robustness,
@@ -1772,17 +1962,47 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
          NIR_PASS(_, nir, nir_io_add_intrinsic_xfb_info);
       }
 
-      nir_shaders[i] = nir;
+      generated[total_shaders] = false;
+      nir_shaders[total_shaders++] = nir;
+
+      if (xfb_gs && i == last_vtg) {
+         enum mesa_prim prim;
+         if (nir->info.stage == MESA_SHADER_TESS_EVAL) {
+            /* The TCS may supply the primitive mode or point mode. */
+            const nir_shader *tcs = nir_shaders[total_shaders - 2u];
+            enum tess_primitive_mode mode =
+               nir->info.tess._primitive_mode ?: tcs->info.tess._primitive_mode;
+            if (nir->info.tess.point_mode || tcs->info.tess.point_mode)
+               prim = MESA_PRIM_POINTS;
+            else if (mode == TESS_PRIMITIVE_ISOLINES)
+               prim = MESA_PRIM_LINES;
+            else
+               prim = MESA_PRIM_TRIANGLES;
+         } else {
+            /* The topology is dynamic within its class. This variant takes
+             * the class's list or strip; a second one takes its adjacency
+             * topologies. */
+            prim = u_reduced_prim(
+               vk_topology_to_mesa(state->ia->primitive_topology));
+         }
+
+         nir_shader *gs = kk_xfb_passthrough_gs(nir, prim);
+         NIR_PASS(_, gs, nir_opt_constant_folding);
+         NIR_PASS(_, gs, nir_io_add_intrinsic_xfb_info);
+         nir->info.next_stage = MESA_SHADER_GEOMETRY;
+
+         generated[total_shaders] = true;
+         nir_shaders[total_shaders++] = gs;
+      }
    }
 
    /* Since we don't support GPL nor shader objects and Metal render pipelines
     * require both vertex and fragment, we may need to provide a pass-through
     * fragment. */
-   uint32_t total_shaders = shader_count;
    if (state && infos[shader_count - 1u].stage != MESA_SHADER_FRAGMENT) {
-      nir_shaders[shader_count] =
+      generated[total_shaders] = true;
+      nir_shaders[total_shaders++] =
          get_empty_nir(dev, MESA_SHADER_FRAGMENT, state, features);
-      total_shaders += 1u;
    }
 
    /* KK_WORKAROUND_19 */
@@ -1807,11 +2027,27 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
 
    for (uint32_t i = 0; i < total_shaders; i++) {
       struct kk_shader *prev_stage = i > 0 ? shaders[i - 1] : NULL;
-      result =
-         kk_compile_shader(dev, nir_shaders[i], prev_stage, vertex_robustness,
-                           state, pAllocator, &shaders[i], apply_wa19);
+      nir_shader *nir = nir_shaders[i];
+
+      /* Only the input assembly feeds adjacency to a passthrough GS. Clone
+       * the linked GS before compiling consumes it. */
+      nir_shader *adjacency = NULL;
+      if (generated[i] && nir->info.stage == MESA_SHADER_GEOMETRY &&
+          infos[last_vtg].stage == MESA_SHADER_VERTEX &&
+          nir->info.gs.input_primitive != MESA_PRIM_POINTS)
+         adjacency = kk_xfb_passthrough_gs_adjacency(nir);
+
+      result = kk_compile_shader(dev, nir, prev_stage, vertex_robustness,
+                                 state, pAllocator, &shaders[i], apply_wa19);
+
+      if (result == VK_SUCCESS && adjacency) {
+         kk_compile_gs_adjacency(pdev, adjacency, vertex_robustness, state,
+                                 shaders[i]);
+      }
 
       if (result != VK_SUCCESS) {
+         ralloc_free(adjacency);
+
          /* Clean up all the shaders before this point */
          for (uint32_t j = 0; j < i; j++)
             kk_shader_destroy(&dev->vk, shaders[j], pAllocator);
@@ -1843,22 +2079,20 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
    } else {
       gather_graphics_pipeline_create_info(state, shaders, total_shaders);
       result = kk_compile_graphics_pipeline(dev, shaders[0]);
-
-      /* Free generated fragment shader */
-      if (shader_count != total_shaders)
-         kk_shader_destroy(&dev->vk, shaders[shader_count], pAllocator);
    }
 
-   if (result != VK_SUCCESS) {
-      for (uint32_t i = 0; i < shader_count; i++) {
+   /* The VS has the pipeline data now, so free the generated shaders. */
+   uint32_t out_count = 0u;
+   for (uint32_t i = 0; i < total_shaders; i++) {
+      if (generated[i] || result != VK_SUCCESS)
          kk_shader_destroy(&dev->vk, shaders[i], pAllocator);
-      }
-
-      /* Memset the output array */
-      memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
-   } else {
-      memcpy(shaders_out, shaders, shader_count * sizeof(*shaders_out));
+      else
+         shaders_out[out_count++] = &shaders[i]->vk;
    }
+
+   /* Clear the output array on failure. */
+   if (result != VK_SUCCESS)
+      memset(shaders_out, 0, shader_count * sizeof(*shaders_out));
 
    return result;
 }
@@ -1888,6 +2122,13 @@ kk_has_gs_count(const struct kk_shader_info *info)
    const struct poly_gs_info *gs =
       info->stage == MESA_SHADER_GEOMETRY ? &info->gs : &info->vs.gs;
    return kk_has_pre_gs(info) && gs->count_words;
+}
+
+/* Only the VS keeps the passthrough GS, so only it has the variant */
+static bool
+kk_has_gs_adjacency(const struct kk_shader_info *info)
+{
+   return info->stage == MESA_SHADER_VERTEX && info->vs.gs_adjacency;
 }
 
 static void
@@ -1920,6 +2161,8 @@ kk_shader_serialize(struct vk_device *vk_dev, const struct vk_shader *vk_shader,
       kk_msl_serialize(&shader->gs_count, blob);
    if (kk_has_pre_gs(&shader->info))
       kk_msl_serialize(&shader->pre_gs, blob);
+   if (kk_has_gs_adjacency(&shader->info))
+      kk_msl_serialize(&shader->gs_rast_adjacency, blob);
 
    return !blob->out_of_memory;
 }
@@ -1992,6 +2235,12 @@ kk_deserialize_shader(struct vk_device *vk_dev, struct blob_reader *blob,
 
    if (kk_has_pre_gs(&info)) {
       result = kk_msl_deserialize(blob, &shader->pre_gs);
+      if (result != VK_SUCCESS)
+         goto fail;
+   }
+
+   if (kk_has_gs_adjacency(&info)) {
+      result = kk_msl_deserialize(blob, &shader->gs_rast_adjacency);
       if (result != VK_SUCCESS)
          goto fail;
    }

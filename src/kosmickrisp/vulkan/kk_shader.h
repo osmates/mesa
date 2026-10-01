@@ -94,6 +94,9 @@ struct kk_shader_info {
          /* Application or generated GS info, valid when additional_stages_bits
           * includes a geometry shader */
          struct poly_gs_info gs;
+
+         /* The passthrough GS has a variant for adjacency topologies */
+         bool gs_adjacency;
       } vs;
 
       struct {
@@ -132,6 +135,9 @@ struct kk_pipeline_handles {
          /* XFB pre-GS pipeline and count pipeline, if needed */
          mtl_compute_pipeline_state *gs_count;
          mtl_compute_pipeline_state *pre_gs;
+         /* Render pipeline of the passthrough GS variant for adjacency
+          * topologies, if any */
+         mtl_render_pipeline_state *render_adjacency;
          mtl_depth_stencil_state *ds_handle;
          uint32_t pre_render_count;
       } gfx;
@@ -156,6 +162,10 @@ struct kk_shader {
    /* XFB pre-GS and count shader; code is NULL when the program isn't needed. */
    struct msl_compile_data gs_count;
    struct msl_compile_data pre_gs;
+   /* Rasterization VS of the passthrough GS variant taking adjacency input,
+    * so draws with adjacency topologies need no unroll. NULL for an
+    * application GS, a point passthrough or one fed by tessellation. */
+   struct msl_compile_data gs_rast_adjacency;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_shader, vk.base, VkShaderEXT,

@@ -833,8 +833,8 @@ kk_calculate_vbo_clamp(uint64_t vbuf, uint64_t sink, enum pipe_format format,
    }
 }
 
-/* The VS keeps the pipeline's GS info. Return NULL if the pipeline has no
- * GS. */
+/* The VS keeps the pipeline's GS info, including a passthrough GS added
+ * for transform feedback. Return NULL if the pipeline has no GS. */
 static const struct poly_gs_info *
 kk_gs_info(struct kk_cmd_buffer *cmd)
 {
@@ -844,6 +844,17 @@ kk_gs_info(struct kk_cmd_buffer *cmd)
       return &vs->info.vs.gs;
 
    return NULL;
+}
+
+/* Whether the draw uses the passthrough GS variant for adjacency topologies,
+ * which has its own render pipeline */
+static bool
+kk_gs_adjacency(struct kk_cmd_buffer *cmd)
+{
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   return vs->pipeline.gfx.render_adjacency &&
+          mesa_prim_has_adjacency(vk_topology_to_mesa(
+             cmd->vk.dynamic_graphics_state.ia.primitive_topology));
 }
 
 /* The GS output primitive if one is bound, otherwise the input topology */
@@ -1010,9 +1021,13 @@ kk_flush_pipeline(struct kk_cmd_buffer *cmd)
       mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
    }
 
-   if (IS_SHADER_DIRTY(VERTEX)) {
-      struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
-      mtl_render_set_pipeline_state(enc, vs->pipeline.gfx.render);
+   /* A passthrough GS has a render pipeline per topology class variant */
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   if (IS_SHADER_DIRTY(VERTEX) || (IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) &&
+                                   vs->pipeline.gfx.render_adjacency)) {
+      mtl_render_set_pipeline_state(enc, kk_gs_adjacency(cmd)
+                                            ? vs->pipeline.gfx.render_adjacency
+                                            : vs->pipeline.gfx.render);
       if (gfx->depth_stencil_state)
          mtl_set_depth_stencil_state(enc, gfx->depth_stencil_state);
    }
@@ -2021,11 +2036,12 @@ requires_unroll(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
 {
    /* No need to unroll for tessellation. Robustness is handled by tessellator,
     * restart is not supported for patch lists, and flat-shading does not have a
-    * well-defined vertex used when tessellating. A GS reads any index size and
-    * topology through poly's bounds-checked input assembly, and
-    * kk_draw_without_restart unrolls restart before it runs. */
+    * well-defined vertex used when tessellating. A GS, the passthrough one
+    * included, reads any index size and topology through poly's bounds-checked
+    * input assembly, and kk_draw_without_restart unrolls restart before it
+    * runs. */
    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
-   bool geom = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+   bool geom = kk_gs_info(cmd);
    if (tess || geom)
       return false;
 
