@@ -833,13 +833,26 @@ kk_calculate_vbo_clamp(uint64_t vbuf, uint64_t sink, enum pipe_format format,
    }
 }
 
+/* The VS keeps the pipeline's GS info. Return NULL if the pipeline has no
+ * GS. */
+static const struct poly_gs_info *
+kk_gs_info(struct kk_cmd_buffer *cmd)
+{
+   struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
+   if (vs && (vs->info.vs.additional_stages_bits &
+              BITFIELD_BIT(MESA_SHADER_GEOMETRY)))
+      return &vs->info.vs.gs;
+
+   return NULL;
+}
+
 /* The GS output primitive if one is bound, otherwise the input topology */
 static enum mesa_prim
 kk_rast_prim(struct kk_cmd_buffer *cmd)
 {
-   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+   const struct poly_gs_info *gs = kk_gs_info(cmd);
    if (gs)
-      return gs->info.gs.mode;
+      return gs->mode;
 
    return vk_topology_to_mesa(
       cmd->vk.dynamic_graphics_state.ia.primitive_topology);
@@ -1285,9 +1298,9 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
    bool indirect = kk_grid_is_indirect(draw->grid) ||
                    cmd->state.shaders[MESA_SHADER_TESS_EVAL];
    struct kk_graphics_state *gfx = &cmd->state.gfx;
-   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
-   enum poly_gs_shape shape = gs->info.gs.shape;
-   uint32_t max_indices = gs->info.gs.max_indices;
+   const struct poly_gs_info *gs = kk_gs_info(cmd);
+   enum poly_gs_shape shape = gs->shape;
+   uint32_t max_indices = gs->max_indices;
 
    enum mesa_prim mode = kk_gs_in_prim(cmd);
    if (restart)
@@ -1320,9 +1333,9 @@ kk_upload_geometry_params(struct kk_cmd_buffer *cmd,
 
    if (shape == POLY_GS_SHAPE_STATIC_INDEXED) {
       /* Metal has no 8-bit indices and restarts 16-bit ones at 0xFFFF */
-      uint16_t indices[ARRAY_SIZE(gs->info.gs.topology)];
+      uint16_t indices[ARRAY_SIZE(gs->topology)];
       for (uint32_t i = 0u; i < max_indices; ++i) {
-         uint8_t index = gs->info.gs.topology[i];
+         uint8_t index = gs->topology[i];
          indices[i] = index == UINT8_MAX ? UINT16_MAX : index;
       }
 
@@ -1362,7 +1375,7 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
    }
 
    if (IS_DIRTY(RS_CULL_MODE) || IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) ||
-       IS_SHADER_DIRTY(GEOMETRY)) {
+       IS_SHADER_DIRTY(VERTEX) || IS_SHADER_DIRTY(GEOMETRY)) {
       /* Only disable rendering if primitive type is culled. */
       gfx->is_cull_front_and_back =
          dyn->rs.cull_mode == VK_CULL_MODE_FRONT_AND_BACK &&
@@ -1755,7 +1768,7 @@ build_per_draw_upload_mask(struct kk_cmd_buffer *cmd)
    }
 
    /* So does a GS */
-   if (cmd->state.shaders[MESA_SHADER_GEOMETRY]) {
+   if (kk_gs_info(cmd)) {
       mask |= BITFIELD_BIT(MESA_SHADER_GEOMETRY);
    }
 
@@ -2214,10 +2227,10 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
    struct kk_graphics_state *gfx = &cmd->state.gfx;
    struct kk_shader *vs = cmd->state.shaders[MESA_SHADER_VERTEX];
    struct kk_shader *tes = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
-   struct kk_shader *gs = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+   const struct poly_gs_info *gs = kk_gs_info(cmd);
    uint64_t vertex_params = gfx->per_draw_data.vertex_params;
    uint64_t geometry_params = gfx->per_draw_data.geometry_params;
-   enum poly_gs_shape shape = gs->info.gs.shape;
+   enum poly_gs_shape shape = gs->shape;
    struct kk_grid grid_vs, grid_gs;
 
    enum mesa_prim mode = kk_gs_in_prim(cmd);
@@ -2236,7 +2249,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
          .heap = kk_heap(cmd),
          .vs_outputs = (tes ? tes : vs)->info.outputs_written,
          .prim = mode,
-         .max_indices = gs->info.gs.max_indices,
+         .max_indices = gs->max_indices,
          .shape = shape,
       };
 
@@ -2284,7 +2297,7 @@ kk_launch_gs_prerast(struct kk_cmd_buffer *cmd,
    kk_dispatch_compute(enc, grid_gs, local_size);
 
    struct kk_draw_data rast = {
-      .primitive_type = mesa_prim_to_mtl_primitive_type(gs->info.gs.mode),
+      .primitive_type = mesa_prim_to_mtl_primitive_type(gs->mode),
    };
 
    if (poly_gs_indexed(shape)) {
@@ -2310,8 +2323,7 @@ build_draw_data(struct kk_cmd_buffer *cmd, struct kk_draw_command *data,
                 uint32_t draw_id)
 {
    /* Emulated stages rasterize a primitive of their own */
-   bool emulated = cmd->state.shaders[MESA_SHADER_TESS_EVAL] ||
-                   cmd->state.shaders[MESA_SHADER_GEOMETRY];
+   bool emulated = cmd->state.shaders[MESA_SHADER_TESS_EVAL] || kk_gs_info(cmd);
    struct kk_draw_data draw = {
       .index.gpu = data->index_buffer,
       .index.el_size_B = data->index_buffer_el_size_B,
@@ -2362,7 +2374,7 @@ kk_draw(struct kk_cmd_buffer *cmd, struct kk_draw_command *data)
       return;
 
    bool tess = cmd->state.shaders[MESA_SHADER_TESS_EVAL];
-   bool geom = cmd->state.shaders[MESA_SHADER_GEOMETRY];
+   bool geom = kk_gs_info(cmd);
 
    /* Unroll geometry. Skip draw if we fail. */
    if (requires_unroll(cmd, data) && !kk_unroll_geometry(cmd, data))

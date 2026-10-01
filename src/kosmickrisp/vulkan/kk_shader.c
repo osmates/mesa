@@ -1482,6 +1482,7 @@ gather_graphics_pipeline_create_info(
 
       if (s->info.stage == MESA_SHADER_GEOMETRY) {
          kk_msl_copy(&vs->gs_main, &s->gs_main);
+         info->vs.gs = s->info.gs;
          gs = s;
       }
    }

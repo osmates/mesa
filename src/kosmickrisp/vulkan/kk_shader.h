@@ -90,6 +90,10 @@ struct kk_shader_info {
          bool has_ds;
          bool has_depth_write;
          bool has_stencil_test;
+
+         /* Application or generated GS info, valid when additional_stages_bits
+          * includes a geometry shader */
+         struct poly_gs_info gs;
       } vs;
 
       struct {
