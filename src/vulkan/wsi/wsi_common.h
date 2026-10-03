@@ -253,6 +253,9 @@ struct wsi_device {
    WSI_CB(GetPhysicalDeviceQueueFamilyProperties);
    WSI_CB(GetQueryPoolResults);
    WSI_CB(GetSemaphoreFdKHR);
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   WSI_CB(GetSemaphoreWin32HandleKHR);
+#endif
    WSI_CB(ResetFences);
    WSI_CB(QueueSubmit2);
    WSI_CB(SetDebugUtilsObjectNameEXT);

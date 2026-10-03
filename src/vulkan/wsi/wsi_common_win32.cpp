@@ -39,7 +39,7 @@
 #include <strsafe.h>
 
 #include <dxgi1_4.h>
-#include <d3d11.h>
+#include <d3d11_4.h>
 #include <directx/d3d12.h>
 #include <dxguids/dxguids.h>
 
@@ -63,8 +63,8 @@ struct wsi_win32 {
       IDCompositionDevice *dcomp;
    } dxgi;
    struct {
-      ID3D11Device *device;
-      ID3D11DeviceContext *context;
+      ID3D11Device5 *device;
+      ID3D11DeviceContext4 *context;
    } d3d11;
 };
 
@@ -80,8 +80,11 @@ struct wsi_win32_image {
    struct wsi_win32_swapchain *chain;
    struct {
       ID3D12Resource *swapchain_res;
+
       ID3D11Texture2D *swapchain_tex;
       ID3D11Texture2D *blit_tex;
+      ID3D11Fence *fence[WSI_ES_COUNT];
+      HANDLE event;
    } dxgi;
    struct {
       HDC dc;
@@ -585,6 +588,100 @@ wsi_create_dxgi_image_mem(const struct wsi_swapchain *drv_chain,
                               &chain->base.alloc, &image->memory);
 }
 
+VkResult
+wsi_create_image_explicit_sync_win32(const struct wsi_swapchain *drv_chain,
+                                     struct wsi_image *image)
+{
+   /* Cleanup of any failures is handled by the caller in wsi_create_image
+    * calling wsi_destroy_image -> wsi_destroy_image_explicit_sync_win32. */
+
+   struct wsi_win32_swapchain *chain = (struct wsi_win32_swapchain *)drv_chain;
+   const struct wsi_device *wsi = chain->base.wsi;
+   VkResult result = VK_SUCCESS;
+
+   struct wsi_win32_image *win32_image =
+      container_of(image, struct wsi_win32_image, base);
+
+   const VkExportSemaphoreCreateInfo semaphore_export_info = {
+      .sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+      /* This is a NT monitored fence handle. */
+      .handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE_BIT,
+   };
+
+   const VkSemaphoreTypeCreateInfo semaphore_type_info = {
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+      .pNext = &semaphore_export_info,
+      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE,
+   };
+
+   const VkSemaphoreCreateInfo semaphore_info = {
+      .sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+      .pNext = &semaphore_type_info,
+   };
+
+   for (uint32_t i = 0; i < WSI_ES_COUNT; i++) {
+      result = wsi->CreateSemaphore(chain->base.device,
+                                    &semaphore_info,
+                                    &chain->base.alloc,
+                                    &image->explicit_sync[i].semaphore);
+      if (result != VK_SUCCESS)
+         return result;
+
+      const VkSemaphoreGetWin32HandleInfoKHR semaphore_get_info = {
+         .sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_WIN32_HANDLE_INFO_KHR,
+         .semaphore = image->explicit_sync[i].semaphore,
+         .handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE_BIT,
+      };
+
+      result = wsi->GetSemaphoreWin32HandleKHR(chain->base.device,
+                                               &semaphore_get_info,
+                                               &image->explicit_sync[i].nt_handle);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
+   for (uint32_t i = 0; i < WSI_ES_COUNT; i++) {
+      if (FAILED(chain->wsi->d3d11.device->OpenSharedFence(image->explicit_sync[i].nt_handle,
+                                                           IID_PPV_ARGS(&win32_image->dxgi.fence[i]))))
+         return VK_ERROR_FEATURE_NOT_PRESENT;
+   }
+
+   win32_image->dxgi.event = CreateEventA(NULL, FALSE, FALSE, NULL);
+
+   return VK_SUCCESS;
+}
+
+void
+wsi_destroy_image_explicit_sync_win32(const struct wsi_swapchain *chain,
+                                      struct wsi_image *image)
+{
+   const struct wsi_device *wsi = chain->wsi;
+   struct wsi_win32_image *win32_image =
+      container_of(image, struct wsi_win32_image, base);
+
+   for (uint32_t i = 0; i < WSI_ES_COUNT; i++) {
+      if (win32_image->dxgi.fence[i]) {
+         win32_image->dxgi.fence[i]->Release();
+         win32_image->dxgi.fence[i] = NULL;
+      }
+
+      if (image->explicit_sync[i].nt_handle != 0) {
+         CloseHandle(image->explicit_sync[i].nt_handle);
+         image->explicit_sync[i].handle = 0;
+      }
+
+      if (image->explicit_sync[i].semaphore != VK_NULL_HANDLE) {
+         wsi->DestroySemaphore(chain->device, image->explicit_sync[i].semaphore, &chain->alloc);
+         image->explicit_sync[i].semaphore = VK_NULL_HANDLE;
+      }
+   }
+
+   if (win32_image->dxgi.event != NULL) {
+      CloseHandle(win32_image->dxgi.event);
+      win32_image->dxgi.event = NULL;
+   }
+}
+
 enum wsi_swapchain_blit_type
 wsi_dxgi_image_needs_blit(const struct wsi_device *wsi,
                           const struct wsi_dxgi_image_params *params,
@@ -614,6 +711,11 @@ wsi_dxgi_configure_image(const struct wsi_swapchain *drv_chain,
       wsi_configure_image(drv_chain, pCreateInfo, handle_types, info);
    if (result != VK_SUCCESS)
       return result;
+
+   if (chain->wsi->d3d11.device) {
+      assert(wsi_device_supports_explicit_sync((wsi_device *) chain->base.wsi));
+      info->explicit_sync = true;
+   }
 
    info->create_mem = wsi_create_dxgi_image_mem;
 
@@ -838,6 +940,41 @@ wsi_win32_acquire_next_image(struct wsi_swapchain *drv_chain,
       index = (index + 1) % chain->base.image_count;
       assert(chain->images[index].state == WSI_IMAGE_QUEUED);
    }
+
+   /* TODO: we need a way to signal info->semaphore and info->fence for Venus.
+    *
+    * vkQueueSubmit with ES_RELEASE as wait and info->semaphore as signal +
+    * info->fence should probably do, but it's not that efficient, surely we
+    * can do better. This is not ideal, but Venus on Linux also uses sync_wait
+    * for WSI, so maybe it's fine?
+    *
+    * I guess "importing" nt_handle + timeline point and pretending it's
+    * a SYNC_FD should do
+    */
+   VK_FROM_HANDLE(vk_physical_device, pdevice, chain->wsi->physical_device);
+   const bool explicit_sync = chain->wsi->d3d11.context &&
+      chain->base.image_info.explicit_sync &&
+      pdevice->supported_sync_types == NULL &&
+      chain->base.present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR;
+   if (explicit_sync) {
+      struct wsi_win32_image *win32_image = &chain->images[index];
+      ID3D11Fence *fence = win32_image->dxgi.fence[WSI_ES_RELEASE];
+      uint64_t value = win32_image->base.explicit_sync[WSI_ES_RELEASE].timeline;
+
+      if (FAILED(fence->SetEventOnCompletion(value, win32_image->dxgi.event)))
+         return VK_ERROR_DEVICE_LOST;
+
+      DWORD res = WaitForSingleObject(win32_image->dxgi.event, info->timeout);
+      switch (res) {
+      case WAIT_OBJECT_0:
+         break;
+      case WAIT_TIMEOUT:
+         return VK_TIMEOUT;
+      default:
+         return VK_ERROR_DEVICE_LOST;
+      }
+   }
+
    if (chain->wsi->wsi->WaitForFences(chain->base.device, 1,
                                       &chain->base.fences[index],
                                       false, info->timeout) != VK_SUCCESS)
@@ -868,9 +1005,58 @@ wsi_win32_queue_present_dxgi(struct wsi_win32_swapchain *chain,
       rects,
    };
 
+   /* TODO: explicit sync is perf "regression" for vkcube, but should be
+    * theoretically more correct in terms of synchronization.
+    *
+    * On Intel Arc B580 with Venus:
+    * no wait + no signal: ~850 fps
+    * no wait +    signal: ~570 fps
+    *    wait + no signal: ~400 fps
+    *    wait +    signal: ~300 fps
+    *
+    * Can we do any better?
+    */
+
+   const bool explicit_sync = image->chain->wsi->d3d11.context &&
+      image->chain->base.image_info.explicit_sync &&
+      chain->base.present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR;
+
+   /* I don't think we can realistically use IDXGIKeyedMutex here without
+    * copying what DXVK does:
+    * - split shared resource handle into resource, syncobj, keyed mutex
+    * - re-export resource and syncobj, import them into Vulkan
+    * - use syncobj essentially as ID3D11Fence
+    * So probably no point in doing this unless we need to target Windows < 10
+    */
+   if (explicit_sync)
+      image->chain->wsi->d3d11.context->Wait(image->dxgi.fence[WSI_ES_ACQUIRE],
+                                             image->base.explicit_sync[WSI_ES_ACQUIRE].timeline);
+
    if (image->dxgi.blit_tex) {
-      image->chain->wsi->d3d11.context->CopyResource(image->dxgi.swapchain_tex, image->dxgi.blit_tex);
+      /* TODO: test this */
+      for (uint32_t r = 0; r < rect_count; r++) {
+         D3D11_BOX box = {
+            .left = (UINT) rects[r].left,
+            .top = (UINT) rects[r].top,
+            .front = 0,
+            .right = (UINT) rects[r].right,
+            .bottom = (UINT) rects[r].bottom,
+            .back = 1,
+         };
+         image->chain->wsi->d3d11.context->CopySubresourceRegion(
+            image->dxgi.swapchain_tex, 0, box.left, box.top, box.front,
+            image->dxgi.blit_tex, 0, &box);
+      }
+
+      if (!rect_count) {
+         image->chain->wsi->d3d11.context->CopyResource(image->dxgi.swapchain_tex,
+                                                        image->dxgi.blit_tex);
+      }
    }
+
+   if (explicit_sync)
+      image->chain->wsi->d3d11.context->Signal(image->dxgi.fence[WSI_ES_RELEASE],
+                                               image->base.explicit_sync[WSI_ES_RELEASE].timeline);
 
    image->state = WSI_IMAGE_QUEUED;
    UINT sync_interval = chain->base.present_mode == VK_PRESENT_MODE_FIFO_KHR ? 1 : 0;
@@ -940,7 +1126,7 @@ wsi_win32_surface_create_swapchain_dxgi(
    IDXGIFactory4 *factory = wsi->dxgi.factory;
 
    VK_FROM_HANDLE(vk_physical_device, pdevice, wsi->physical_device);
-   IUnknown *d3d_device = NULL;
+   IUnknown *d3d_device = nullptr;
    if (wsi->wsi->win32.get_d3d12_command_queue) {
       d3d_device = (ID3D12CommandQueue *)
          wsi->wsi->win32.get_d3d12_command_queue(device);
@@ -1038,14 +1224,14 @@ d3d11_init_device_and_context(struct wsi_win32 *wsi, bool debug)
 
    D3D11CreateDevice = (PFN_D3D11_CREATE_DEVICE)GetProcAddress(d3d11_mod, "D3D11CreateDevice");
    if (!D3D11CreateDevice) {
-      return NULL;
+      return false;
    }
 
    LUID adapter_luid;
    static_assert(sizeof(adapter_luid) == VK_LUID_SIZE);
    memcpy(&adapter_luid, pdevice->properties.deviceLUID, VK_LUID_SIZE);
 
-   IDXGIAdapter *adapter = NULL;
+   IDXGIAdapter *adapter = nullptr;
    HRESULT hr = wsi->dxgi.factory->EnumAdapterByLuid(adapter_luid,
                                                      IID_PPV_ARGS(&adapter));
    if (FAILED(hr)) {
@@ -1056,9 +1242,26 @@ d3d11_init_device_and_context(struct wsi_win32 *wsi, bool debug)
    if (debug)
       flags |= D3D11_CREATE_DEVICE_DEBUG;
 
-   hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, flags, NULL, 0, D3D11_SDK_VERSION, &wsi->d3d11.device, NULL, &wsi->d3d11.context);
+   ID3D11Device *device = nullptr;
+   ID3D11DeviceContext *context = nullptr;
+
+   hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, flags, NULL, 0, D3D11_SDK_VERSION, &device, NULL, &context);
    adapter->Release();
+   if (FAILED(hr))
+      return false;
+
+   hr = device->QueryInterface(&wsi->d3d11.device);
+   device->Release();
    if (FAILED(hr)) {
+      context->Release();
+      return false;
+   }
+
+   hr = context->QueryInterface(&wsi->d3d11.context);
+   context->Release();
+   if (FAILED(hr)) {
+      wsi->d3d11.device->Release();
+      wsi->d3d11.device = NULL;
       return false;
    }
 

@@ -150,6 +150,9 @@ struct wsi_image_explicit_sync_timeline {
    uint64_t timeline;
    int fd;
    uint32_t handle;
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   void *nt_handle;
+#endif
 };
 
 enum wsi_swapchain_blit_type {
@@ -508,6 +511,16 @@ wsi_drm_wait_for_explicit_sync_release(struct wsi_swapchain *chain,
 VkResult
 wsi_drm_init_swapchain_implicit_sync(struct wsi_swapchain *chain);
 
+#endif
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+VkResult
+wsi_create_image_explicit_sync_win32(const struct wsi_swapchain *chain,
+                                     struct wsi_image *image);
+
+void
+wsi_destroy_image_explicit_sync_win32(const struct wsi_swapchain *chain,
+                                      struct wsi_image *image);
 #endif
 
 struct wsi_interface {

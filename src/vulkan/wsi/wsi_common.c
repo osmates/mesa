@@ -229,6 +229,9 @@ wsi_device_init(struct wsi_device *wsi,
    WSI_GET_CB(GetCalibratedTimestampsKHR);
    WSI_GET_CB(GetQueryPoolResults);
    WSI_GET_CB(GetSemaphoreFdKHR);
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   WSI_GET_CB(GetSemaphoreWin32HandleKHR);
+#endif
    WSI_GET_CB(ResetFences);
    WSI_GET_CB(QueueSubmit2);
    WSI_GET_CB(SetDebugUtilsObjectNameEXT);
@@ -922,6 +925,10 @@ wsi_create_image(const struct wsi_swapchain *chain,
       result = wsi_create_image_explicit_sync_drm(chain, image);
       if (result != VK_SUCCESS)
          goto fail;
+#elif defined(VK_USE_PLATFORM_WIN32_KHR)
+      result = wsi_create_image_explicit_sync_win32(chain, image);
+      if (result != VK_SUCCESS)
+         goto fail;
 #else
       result = VK_ERROR_FEATURE_NOT_PRESENT;
       goto fail;
@@ -1036,6 +1043,8 @@ wsi_destroy_image(const struct wsi_swapchain *chain,
    if (image->explicit_sync[WSI_ES_ACQUIRE].semaphore) {
 #if HAVE_LIBDRM
       wsi_destroy_image_explicit_sync_drm(chain, image);
+#elif defined(VK_USE_PLATFORM_WIN32_KHR)
+      wsi_destroy_image_explicit_sync_win32(chain, image);
 #endif
    }
 
@@ -3707,7 +3716,8 @@ wsi_device_supports_explicit_sync(struct wsi_device *device)
 {
    return !device->sw && device->has_timeline_semaphore &&
       (device->timeline_semaphore_export_handle_types &
-       VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT);
+       (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT |
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D11_FENCE_BIT));
 }
 
 /**
