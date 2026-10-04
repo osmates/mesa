@@ -258,11 +258,164 @@ merge_extension_names(const char *const *exts,
    return true;
 }
 
+struct vn_device_create_info {
+   VkDeviceCreateInfo create;
+   VkDeviceGroupDeviceCreateInfo group;
+   VkPhysicalDeviceFeatures2 features2;
+   VkPhysicalDeviceVulkan11Features features11;
+   VkPhysicalDeviceVulkan12Features features12;
+   VkPhysicalDeviceVulkan13Features features13;
+   VkPhysicalDeviceRobustness2FeaturesEXT robustness2;
+   VkPhysicalDeviceDescriptorIndexingFeatures descriptor_indexing;
+   VkPhysicalDeviceHostQueryResetFeatures host_query_reset;
+   VkPhysicalDeviceShaderDrawParametersFeatures shader_draw_parameters;
+   VkPhysicalDeviceShaderFloat16Int8Features shader_float16_int8;
+   VkPhysicalDevice8BitStorageFeatures storage_8bit;
+   VkPhysicalDevice16BitStorageFeatures storage_16bit;
+   VkPhysicalDeviceUniformBufferStandardLayoutFeatures
+      uniform_buffer_standard_layout;
+   VkPhysicalDeviceScalarBlockLayoutFeatures scalar_block_layout;
+   VkPhysicalDeviceTimelineSemaphoreFeatures timeline_semaphore;
+   VkPhysicalDeviceBufferDeviceAddressFeatures buffer_device_address;
+   VkPhysicalDeviceImagelessFramebufferFeatures imageless_framebuffer;
+   VkPhysicalDeviceSeparateDepthStencilLayoutsFeatures
+      separate_depth_stencil_layouts;
+   VkPhysicalDeviceMemoryPriorityFeaturesEXT memory_priority;
+   VkPhysicalDevicePageableDeviceLocalMemoryFeaturesEXT
+      pageable_device_local_memory;
+};
+
+static bool
+vn_device_enable_timeline_semaphores(const VkDeviceCreateInfo *create_info,
+                                     struct vn_device_create_info *local_info)
+{
+   bool enabled = false;
+   local_info->create = *create_info;
+   void *cur = (void *)&local_info->create;
+
+   vk_foreach_struct_const(sType, src, create_info->pNext) {
+      void *next = NULL;
+      switch (sType) {
+      case VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO:
+         memcpy(&local_info->group, src, sizeof(local_info->group));
+         next = &local_info->group;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2:
+         memcpy(&local_info->features2, src, sizeof(local_info->features2));
+         next = &local_info->features2;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES:
+         memcpy(&local_info->features11, src, sizeof(local_info->features11));
+         next = &local_info->features11;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES:
+         memcpy(&local_info->features12, src, sizeof(local_info->features12));
+         next = &local_info->features12;
+         local_info->features12.timelineSemaphore = VK_TRUE;
+         enabled = true;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES:
+         memcpy(&local_info->features13, src, sizeof(local_info->features13));
+         next = &local_info->features13;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT:
+         memcpy(&local_info->robustness2, src,
+                sizeof(local_info->robustness2));
+         next = &local_info->robustness2;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES:
+         memcpy(&local_info->descriptor_indexing, src,
+                sizeof(local_info->descriptor_indexing));
+         next = &local_info->descriptor_indexing;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES:
+         memcpy(&local_info->host_query_reset, src,
+                sizeof(local_info->host_query_reset));
+         next = &local_info->host_query_reset;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_DRAW_PARAMETERS_FEATURES:
+         memcpy(&local_info->shader_draw_parameters, src,
+                sizeof(local_info->shader_draw_parameters));
+         next = &local_info->shader_draw_parameters;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES:
+         memcpy(&local_info->shader_float16_int8, src,
+                sizeof(local_info->shader_float16_int8));
+         next = &local_info->shader_float16_int8;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES:
+         memcpy(&local_info->storage_8bit, src,
+                sizeof(local_info->storage_8bit));
+         next = &local_info->storage_8bit;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES:
+         memcpy(&local_info->storage_16bit, src,
+                sizeof(local_info->storage_16bit));
+         next = &local_info->storage_16bit;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFORM_BUFFER_STANDARD_LAYOUT_FEATURES:
+         memcpy(&local_info->uniform_buffer_standard_layout, src,
+                sizeof(local_info->uniform_buffer_standard_layout));
+         next = &local_info->uniform_buffer_standard_layout;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SCALAR_BLOCK_LAYOUT_FEATURES:
+         memcpy(&local_info->scalar_block_layout, src,
+                sizeof(local_info->scalar_block_layout));
+         next = &local_info->scalar_block_layout;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES:
+         memcpy(&local_info->timeline_semaphore, src,
+                sizeof(local_info->timeline_semaphore));
+         next = &local_info->timeline_semaphore;
+         local_info->timeline_semaphore.timelineSemaphore = VK_TRUE;
+         enabled = true;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES:
+         memcpy(&local_info->buffer_device_address, src,
+                sizeof(local_info->buffer_device_address));
+         next = &local_info->buffer_device_address;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGELESS_FRAMEBUFFER_FEATURES:
+         memcpy(&local_info->imageless_framebuffer, src,
+                sizeof(local_info->imageless_framebuffer));
+         next = &local_info->imageless_framebuffer;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SEPARATE_DEPTH_STENCIL_LAYOUTS_FEATURES:
+         memcpy(&local_info->separate_depth_stencil_layouts, src,
+                sizeof(local_info->separate_depth_stencil_layouts));
+         next = &local_info->separate_depth_stencil_layouts;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT:
+         memcpy(&local_info->memory_priority, src,
+                sizeof(local_info->memory_priority));
+         next = &local_info->memory_priority;
+         break;
+      case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PAGEABLE_DEVICE_LOCAL_MEMORY_FEATURES_EXT:
+         memcpy(&local_info->pageable_device_local_memory, src,
+                sizeof(local_info->pageable_device_local_memory));
+         next = &local_info->pageable_device_local_memory;
+         break;
+
+      default:
+         break;
+      }
+
+      if (next) {
+         vk_pnext_set_next(cur, next);
+         cur = next;
+      }
+   }
+
+   vk_pnext_set_next(cur, NULL);
+
+   return enabled;
+}
+
 static const VkDeviceCreateInfo *
 vn_device_fix_create_info(const struct vn_device *dev,
                           const VkDeviceCreateInfo *dev_info,
                           const VkAllocationCallbacks *alloc,
-                          VkDeviceCreateInfo *local_info)
+                          struct vn_device_create_info *local_info)
 {
    const struct vn_physical_device *physical_dev = dev->physical_device;
    const struct vk_device_extension_table *app_exts =
@@ -326,6 +479,29 @@ vn_device_fix_create_info(const struct vn_device *dev,
             VK_ANDROID_EXTERNAL_MEMORY_ANDROID_HARDWARE_BUFFER_EXTENSION_NAME;
       }
    }
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   /* Windows D3D11/DXGI WSI needs timeline semaphores */
+   const VkPhysicalDeviceTimelineSemaphoreFeatures *timeline_features =
+      vk_find_struct_const(dev_info->pNext,
+                           PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES);
+   const VkPhysicalDeviceVulkan12Features *features12 = vk_find_struct_const(
+      dev_info->pNext, PHYSICAL_DEVICE_VULKAN_1_2_FEATURES);
+   const bool timeline_semaphores_enabled =
+      (timeline_features && timeline_features->timelineSemaphore) ||
+      (features12 && features12->timelineSemaphore);
+   const bool need_timeline_semaphores =
+      has_wsi && !timeline_semaphores_enabled;
+
+   if (need_timeline_semaphores &&
+       physical_dev->renderer_version < VK_API_VERSION_1_2 &&
+       !app_exts->KHR_timeline_semaphore) {
+      extra_exts[extra_count++] =
+         VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
+   }
+#else
+   const bool need_timeline_semaphores = false;
+#endif
 
    if (app_exts->KHR_external_memory_fd ||
        app_exts->EXT_external_memory_dma_buf || has_wsi) {
@@ -409,18 +585,28 @@ vn_device_fix_create_info(const struct vn_device *dev,
    assert(extra_count <= ARRAY_SIZE(extra_exts));
    assert(block_count <= ARRAY_SIZE(block_exts));
 
-   if (!extra_count && (!block_count || !dev_info->enabledExtensionCount))
+   if (!extra_count && (!block_count || !dev_info->enabledExtensionCount) &&
+       !need_timeline_semaphores)
       return dev_info;
 
-   *local_info = *dev_info;
+   if (need_timeline_semaphores &&
+       !vn_device_enable_timeline_semaphores(dev_info, local_info)) {
+      __vk_append_struct(&local_info->create,
+                         &local_info->timeline_semaphore);
+      local_info->timeline_semaphore.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+      local_info->timeline_semaphore.timelineSemaphore = VK_TRUE;
+   } else {
+      local_info->create = *dev_info;
+   }
+
    if (!merge_extension_names(dev_info->ppEnabledExtensionNames,
                               dev_info->enabledExtensionCount, extra_exts,
                               extra_count, block_exts, block_count, alloc,
-                              &local_info->ppEnabledExtensionNames,
-                              &local_info->enabledExtensionCount))
+                              &local_info->create.ppEnabledExtensionNames,
+                              &local_info->create.enabledExtensionCount))
       return NULL;
 
-   return local_info;
+   return &local_info->create;
 }
 
 static inline VkResult
@@ -509,7 +695,7 @@ vn_device_init(struct vn_device *dev,
    VkPhysicalDevice physical_dev_handle =
       vn_physical_device_to_handle(physical_dev);
    VkDevice dev_handle = vn_device_to_handle(dev);
-   VkDeviceCreateInfo local_create_info;
+   struct vn_device_create_info local_create_info;
    VkResult result;
 
    dev->base.vk.get_timestamp = vn_get_timestamp;
@@ -550,7 +736,7 @@ vn_device_init(struct vn_device *dev,
    STACK_ARRAY_FINISH(queue_infos);
 
    /* free the fixed extensions here since no longer needed below */
-   if (create_info == &local_create_info)
+   if (create_info == &local_create_info.create)
       vk_free(alloc, (void *)create_info->ppEnabledExtensionNames);
 
    if (result != VK_SUCCESS)
