@@ -249,6 +249,14 @@ vn_relax(struct vn_relax_state *state)
    const uint32_t busy_wait_order = state->profile.busy_wait_order;
    const uint32_t warn_order = state->profile.warn_order;
    const uint32_t abort_order = state->profile.abort_order;
+   struct vn_instance *instance = state->instance;
+
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   if (vn_renderer_get_device_state(instance->renderer) != VK_SUCCESS) {
+      vn_log(instance, "aborting on device lost");
+      abort();
+   }
+#endif
 
    uint32_t *iter = &state->iter;
    (*iter)++;
@@ -259,7 +267,6 @@ vn_relax(struct vn_relax_state *state)
 
    state->warn = false;
    if (unlikely(*iter % (1 << warn_order) == 0)) {
-      struct vn_instance *instance = state->instance;
       state->warn = true;
       vn_log(instance, "stuck in %s wait with iter at %d", state->reason_str,
              *iter);

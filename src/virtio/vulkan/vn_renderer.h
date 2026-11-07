@@ -135,6 +135,10 @@ struct vn_renderer_ops {
     */
    VkResult (*submit_wait)(struct vn_renderer *renderer,
                            const struct vn_renderer_submit_batch *batch);
+   /*
+    * Returns VK_SUCCESS or VK_ERROR_DEVICE_LOST
+    */
+   VkResult (*get_device_state)(struct vn_renderer *renderer);
 #endif
    /*
     * On success, returns VK_SUCCESS or VK_TIMEOUT.  On failure, returns
@@ -327,6 +331,12 @@ vn_renderer_submit_wait(struct vn_renderer *renderer,
                         const struct vn_renderer_submit_batch *submit)
 {
    return renderer->ops.submit_wait(renderer, submit);
+}
+
+static inline VkResult
+vn_renderer_get_device_state(struct vn_renderer *renderer)
+{
+   return renderer->ops.get_device_state(renderer);
 }
 #endif
 
