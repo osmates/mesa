@@ -1342,6 +1342,11 @@ vn_queue_submit(struct vn_queue_submission *submit)
    struct vn_device *dev = vn_device_from_vk(queue->base.vk.base.device);
    VkResult result;
 
+#ifdef VK_USE_PLATFORM_WIN32_KHR
+   if (dev->renderer->info.needs_implicit_queue_sync)
+      vn_ring_roundtrip(dev->primary_ring);
+#endif
+
    result = vn_queue_submission_prepare_submit(submit);
    if (result != VK_SUCCESS)
       return vn_error(dev->instance, result);
