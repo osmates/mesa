@@ -1770,12 +1770,14 @@ virtgpu_init_context(struct virtgpu *gpu)
 
    if (gpu->ddicb) {
       snprintf((char *)ctx_init.ctx_init.debug_name,
-               sizeof(ctx_init.ctx_init.debug_name), "venus-win32-%llu-%s-%p",
-               (uintptr_t)GetCurrentProcessId(), proc, gpu->ddicb->hRTDevice);
+               sizeof(ctx_init.ctx_init.debug_name), "venus-win32-%lu-%s-%p",
+               (unsigned long)GetCurrentProcessId(), proc,
+               gpu->ddicb->hRTDevice);
    } else {
       snprintf((char *)ctx_init.ctx_init.debug_name,
-               sizeof(ctx_init.ctx_init.debug_name), "venus-win32-%llu-%s-%u",
-               (uintptr_t)GetCurrentProcessId(), proc, gpu->d3dkmt.device);
+               sizeof(ctx_init.ctx_init.debug_name), "venus-win32-%lu-%s-%u",
+               (unsigned long)GetCurrentProcessId(), proc,
+               gpu->d3dkmt.device);
    }
 
    NTSTATUS status =
@@ -2636,7 +2638,7 @@ virtgpu_bo_create_from_device_memory(
             };
 
             vn_log(gpu->instance,
-                   "BLOB INFO: type=%u, flags=%u, size=%zu, "
+                   "BLOB INFO: type=%u, flags=%u, size=%" PRIu64 ", "
                    "id=%" PRIu64 ", format=%u, w=%u, h=%u, mod=0x%016llx",
                    gpu->bo_blob_mem, blob_flags, size, mem_id, format,
                    img->base.vk.extent.width, img->base.vk.extent.height,
@@ -2671,8 +2673,8 @@ virtgpu_bo_create_from_device_memory(
       &kmt_local, &kmt_global, &h);
    if (!NT_SUCCESS(status)) {
       vn_log(gpu->instance,
-             "RESOURCE_CREATE_BLOB failed: type=%u, flags=%u, size=%zu, "
-             "id=%" PRIu64 ", err=0x%lx",
+             "RESOURCE_CREATE_BLOB failed: type=%u, flags=%u, "
+             "size=%" PRIu64 ", id=%" PRIu64 ", err=0x%lx",
              gpu->bo_blob_mem, blob_flags, size, mem_id, status);
       return VK_ERROR_OUT_OF_DEVICE_MEMORY;
    }
