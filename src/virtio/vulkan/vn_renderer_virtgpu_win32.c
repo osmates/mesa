@@ -1958,6 +1958,25 @@ virtgpu_adapter_has_venus(struct virtgpu *gpu, D3DKMT_HANDLE adapter)
           (info.capset_mask & VIRTIO_WDDM_CAPSET_MASK_VENUS);
 }
 
+/* The DXGI swapchain needs a D3D11 device on the adapter, which needs a
+ * user-mode driver for it.
+ */
+static bool
+virtgpu_adapter_has_d3d11(struct virtgpu *gpu)
+{
+   D3DKMT_UMDFILENAMEINFO umd = {
+      .Version = KMTUMDVERSION_DX11,
+   };
+   D3DKMT_QUERYADAPTERINFO query = {
+      .hAdapter = gpu->d3dkmt.adapter,
+      .Type = KMTQAITYPE_UMDRIVERNAME,
+      .pPrivateDriverData = &umd,
+      .PrivateDriverDataSize = sizeof(umd),
+   };
+   NTSTATUS status = gpu->d3dkmt.cb.query_adapter_info(&query);
+   return NT_SUCCESS(status) && umd.UmdFileName[0] != 0;
+}
+
 static VkResult
 virtgpu_find_adapter(struct virtgpu *gpu)
 {
@@ -3400,7 +3419,10 @@ virtgpu_init_renderer_info(struct virtgpu *gpu)
       info->id.node_mask = 1; /* TODO D3D12 interop*/
       memcpy(info->id.luid, &gpu->ddicb->AdapterLuid, VK_LUID_SIZE);
    } else {
-      info->needs_sw_wsi = false;
+      info->needs_sw_wsi = !virtgpu_adapter_has_d3d11(gpu);
+      if (info->needs_sw_wsi && VN_DEBUG(INIT))
+         vn_log(gpu->instance,
+                "no D3D11 driver on the adapter, using sw wsi");
       info->needs_implicit_queue_sync = false;
       info->id.has_luid = true;
       info->id.node_mask = 1; /* TODO D3D12 interop*/
