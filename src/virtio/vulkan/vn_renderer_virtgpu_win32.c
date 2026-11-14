@@ -1920,6 +1920,44 @@ virtgpu_init_params(struct virtgpu *gpu)
    return VK_SUCCESS;
 }
 
+/* Other drivers of a virtio GPU share its PCI IDs, a display-only one among
+ * them: take the adapter whose driver answers this interface with Venus.
+ */
+static bool
+virtgpu_adapter_has_venus(struct virtgpu *gpu, D3DKMT_HANDLE adapter)
+{
+   D3DKMT_QUERY_DEVICE_IDS device_ids = {};
+   D3DKMT_QUERYADAPTERINFO query = {
+      .hAdapter = adapter,
+      .Type = KMTQAITYPE_PHYSICALADAPTERDEVICEIDS,
+      .pPrivateDriverData = &device_ids,
+      .PrivateDriverDataSize = sizeof(device_ids),
+   };
+   NTSTATUS status = gpu->d3dkmt.cb.query_adapter_info(&query);
+   if (!NT_SUCCESS(status)) {
+      vn_log(gpu->instance, "failed to query device ids: 0x%lx", status);
+      return false;
+   }
+   if (device_ids.DeviceIds.VendorID != VIRTGPU_PCI_VENDOR_ID ||
+       device_ids.DeviceIds.DeviceID != VIRTGPU_PCI_DEVICE_ID)
+      return false;
+
+   VIRTIO_WDDM_AdapterInfo info = { 0 };
+   query = (D3DKMT_QUERYADAPTERINFO){
+      .hAdapter = adapter,
+      .Type = KMTQAITYPE_UMDRIVERPRIVATE,
+      .pPrivateDriverData = &info,
+      .PrivateDriverDataSize = sizeof(info),
+   };
+   status = gpu->d3dkmt.cb.query_adapter_info(&query);
+   if (!NT_SUCCESS(status))
+      return false;
+
+   return info.tag == VIRTIO_WDDM_ADAPTER_INFO_TAG && info.supports_3d &&
+          info.has_shmem &&
+          (info.capset_mask & VIRTIO_WDDM_CAPSET_MASK_VENUS);
+}
+
 static VkResult
 virtgpu_find_adapter(struct virtgpu *gpu)
 {
@@ -1931,29 +1969,19 @@ virtgpu_find_adapter(struct virtgpu *gpu)
    }
    adapters.pAdapters =
       calloc(sizeof(*adapters.pAdapters), adapters.NumAdapters);
+   if (!adapters.pAdapters)
+      return VK_ERROR_OUT_OF_HOST_MEMORY;
    status = gpu->d3dkmt.cb.enum_adapters2(&adapters);
    if (!NT_SUCCESS(status)) {
       vn_log(gpu->instance, "failed to enumerate adapters: 0x%lx", status);
+      free(adapters.pAdapters);
       return VK_ERROR_INCOMPATIBLE_DRIVER;
    }
 
    ssize_t virtio_index = -1;
    for (size_t i = 0; i < adapters.NumAdapters; i++) {
-      D3DKMT_QUERY_DEVICE_IDS device_ids = {};
-      D3DKMT_QUERYADAPTERINFO query = {
-         .hAdapter = adapters.pAdapters[i].hAdapter,
-         .Type = KMTQAITYPE_PHYSICALADAPTERDEVICEIDS,
-         .pPrivateDriverData = &device_ids,
-         .PrivateDriverDataSize = sizeof(device_ids),
-      };
-      status = gpu->d3dkmt.cb.query_adapter_info(&query);
-      if (!NT_SUCCESS(status)) {
-         vn_log(gpu->instance, "failed to query device ids: 0x%lx", status);
-         continue;
-      }
-
-      if (device_ids.DeviceIds.VendorID == VIRTGPU_PCI_VENDOR_ID &&
-          device_ids.DeviceIds.DeviceID == VIRTGPU_PCI_DEVICE_ID) {
+      if (virtio_index < 0 &&
+          virtgpu_adapter_has_venus(gpu, adapters.pAdapters[i].hAdapter)) {
          virtio_index = i;
       } else {
          D3DKMT_CLOSEADAPTER close = {
@@ -2026,10 +2054,9 @@ virtgpu_open(struct virtgpu *gpu, void *info)
       D3DKMT_FUNCTIONS
 #undef X
 
-      NTSTATUS status = virtgpu_find_adapter(gpu);
-      if (!NT_SUCCESS(status)) {
-         return VK_ERROR_DEVICE_LOST;
-      }
+      VkResult result = virtgpu_find_adapter(gpu);
+      if (result != VK_SUCCESS)
+         return result;
    }
 
    NTSTATUS status = virtgpu_ioctl_create_device(gpu);
