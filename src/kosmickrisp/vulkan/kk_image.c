@@ -295,6 +295,26 @@ kk_standard_sparse_block_px(enum pipe_format format)
    (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |                                       \
     VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)
 
+static enum mtl_texture_type
+kk_sparse_texture_type(VkImageType type, VkSampleCountFlagBits samples)
+{
+   if (type == VK_IMAGE_TYPE_3D)
+      return MTL_TEXTURE_TYPE_3D;
+   return samples > VK_SAMPLE_COUNT_1_BIT ? MTL_TEXTURE_TYPE_2D_MULTISAMPLE
+                                          : MTL_TEXTURE_TYPE_2D;
+}
+
+static bool
+kk_sparse_texture_supported(const struct kk_physical_device *pdev,
+                            VkImageType type, VkSampleCountFlagBits samples,
+                            const struct kk_va_format *format)
+{
+   const struct mtl_size tile = mtl_placement_sparse_tile_size(
+      pdev->mtl_dev_handle, kk_sparse_texture_type(type, samples),
+      format->mtl_pixel_format, samples);
+   return tile.x != 0 && tile.y != 0 && tile.z != 0;
+}
+
 /* Metal misplaces levels of placement sparse textures in the BC, ETC2 and EAC
  * formats when a level above them is not a whole number of blocks: blits and
  * samples of 51 x 65, 1028 x 1028 or 1920 x 1080 images lose blocks or whole
@@ -314,8 +334,10 @@ kk_sparse_residency_format_supported(enum pipe_format format)
    }
 }
 
-/* Sparse images are single sample 2D colour or depth-only images with optimal
- * tiling, backed by placement sparse textures.
+/* Sparse images have optimal tiling and are backed by placement sparse
+ * textures, which Metal makes for every format. Sparse residency is for
+ * single sample 2D images whose 64 KB tiles are the standard block shape,
+ * without stencil.
  */
 static bool
 kk_image_supports_sparse(struct kk_physical_device *pdev,
@@ -324,20 +346,18 @@ kk_image_supports_sparse(struct kk_physical_device *pdev,
                          const VkPhysicalDeviceExternalImageFormatInfo *external)
 {
    const struct vk_features *features = &pdev->vk.supported_features;
+   const bool residency = info->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT;
 
-   if (!features->sparseBinding)
+   if (!features->sparseBinding || info->tiling != VK_IMAGE_TILING_OPTIMAL)
       return false;
 
-   if ((info->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) &&
-       !features->sparseResidencyImage2D)
+   if (residency &&
+       (!features->sparseResidencyImage2D || info->type != VK_IMAGE_TYPE_2D ||
+        vk_format_has_stencil(info->format)))
       return false;
 
    if ((info->flags & VK_IMAGE_CREATE_SPARSE_ALIASED_BIT) &&
        !features->sparseResidencyAliased)
-      return false;
-
-   if (info->type != VK_IMAGE_TYPE_2D ||
-       info->tiling != VK_IMAGE_TILING_OPTIMAL)
       return false;
 
    /* Block texel views alias subresources at heap offsets, and host copies
@@ -347,27 +367,24 @@ kk_image_supports_sparse(struct kk_physical_device *pdev,
        (external != NULL && external->handleType != 0))
       return false;
 
-   if (vk_format_get_ycbcr_info(info->format) != NULL ||
-       vk_format_has_stencil(info->format))
+   if (vk_format_get_ycbcr_info(info->format) != NULL)
       return false;
 
    const enum pipe_format p_format = vk_format_to_pipe_format(info->format);
    const struct kk_va_format *va_format = kk_get_va_format(p_format);
    if (va_format == NULL ||
-       (!vk_format_has_depth(info->format) && !va_format->sparse))
-      return false;
-
-   const struct mtl_size tile =
-      mtl_placement_sparse_tile_size(pdev->mtl_dev_handle, MTL_TEXTURE_TYPE_2D,
-                                     va_format->mtl_pixel_format, 1u);
-   if (tile.x == 0 || tile.y == 0 || tile.z == 0)
+       !kk_sparse_texture_supported(pdev, info->type, VK_SAMPLE_COUNT_1_BIT,
+                                    va_format))
       return false;
 
    /* Sparse residency promises the standard block shape */
-   if (info->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) {
-      if (!kk_sparse_residency_format_supported(p_format))
-         return false;
+   if (residency && !kk_sparse_residency_format_supported(p_format))
+      return false;
 
+   if (residency) {
+      const struct mtl_size tile = mtl_placement_sparse_tile_size(
+         pdev->mtl_dev_handle, MTL_TEXTURE_TYPE_2D, va_format->mtl_pixel_format,
+         1u);
       const struct mtl_size standard = kk_standard_sparse_block_px(p_format);
       if (tile.x != standard.x || tile.y != standard.y || tile.z != standard.z)
          return false;
@@ -527,7 +544,7 @@ kk_GetPhysicalDeviceImageFormatProperties2(
    }
 
    VkSampleCountFlags sampleCounts = VK_SAMPLE_COUNT_1_BIT;
-   if (!(pImageFormatInfo->flags & KK_IMAGE_CREATE_SPARSE_FLAGS) &&
+   if (!(pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) &&
        pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL &&
        pImageFormatInfo->type == VK_IMAGE_TYPE_2D && ycbcr_info == NULL &&
        (features & (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
@@ -535,6 +552,15 @@ kk_GetPhysicalDeviceImageFormatProperties2(
        !(pImageFormatInfo->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) &&
        !(all_usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
       sampleCounts = pdev->info.supported_sample_counts;
+
+      if (pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
+         const struct kk_va_format *va_format = kk_get_va_format(p_format);
+         u_foreach_bit(b, sampleCounts) {
+            if (!kk_sparse_texture_supported(pdev, VK_IMAGE_TYPE_2D, 1u << b,
+                                             va_format))
+               sampleCounts &= ~(1u << b);
+         }
+      }
    }
 
    /* From the Vulkan 1.2.199 spec:
@@ -742,11 +768,29 @@ kk_image_plane_init_sparse(struct kk_device *dev, struct kk_image_plane *plane)
    kk_sparse_tiles_init(&sparse->tiles);
    sparse->tail_level =
       MIN2(mtl_texture_first_mipmap_in_tail(plane->mtl_handle), layout->levels);
-   sparse->tail_tiles =
-      sparse->tail_level < layout->levels
-         ? DIV_ROUND_UP(mtl_texture_tail_size_in_bytes(plane->mtl_handle),
-                        KK_SPARSE_PAGE_SIZE_B)
-         : 0u;
+   if (sparse->tail_level < layout->levels) {
+      sparse->tail_width =
+         DIV_ROUND_UP(mtl_texture_tail_size_in_bytes(plane->mtl_handle),
+                      KK_SPARSE_PAGE_SIZE_B);
+
+      /* Mapping a tail takes as many heap tiles as the tail levels take in a
+       * heap with GPU-optimized contents, which can be more than
+       * tailSizeInBytes. */
+      struct kk_image_layout tail_layout = *layout;
+      tail_layout.width_px = u_minify(layout->width_px, sparse->tail_level);
+      tail_layout.height_px = u_minify(layout->height_px, sparse->tail_level);
+      tail_layout.depth_px = u_minify(layout->depth_px, sparse->tail_level);
+      tail_layout.levels = layout->levels - sparse->tail_level;
+      tail_layout.layers = 1u;
+      tail_layout.optimized_layout = true;
+      if (tail_layout.type == MTL_TEXTURE_TYPE_2D_ARRAY)
+         tail_layout.type = MTL_TEXTURE_TYPE_2D;
+      uint64_t tail_size_B;
+      mtl_heap_texture_size_and_align_with_descriptor(
+         dev->mtl_handle, &tail_layout, &tail_size_B, NULL);
+      sparse->tail_tiles = MAX2(
+         sparse->tail_width, DIV_ROUND_UP(tail_size_B, KK_SPARSE_PAGE_SIZE_B));
+   }
 
    uint64_t tiles = 0u;
    for (uint32_t level = 0u; level < sparse->tail_level; level++) {
@@ -892,9 +936,15 @@ kk_DestroyImage(VkDevice device, VkImage _image,
    if (!image)
       return;
 
-   if (kk_image_is_sparse(image))
+   if (kk_image_is_sparse(image)) {
+      struct kk_image_sparse *sparse = &image->planes[0].sparse;
       kk_device_remove_texture_from_residency_set(dev,
                                                   image->planes[0].mtl_handle);
+      if (sparse->tail_heap != NULL) {
+         kk_device_remove_heap_from_residency_set(dev, sparse->tail_heap);
+         mtl_release(sparse->tail_heap);
+      }
+   }
 
    kk_image_finish(dev, image, pAllocator);
 

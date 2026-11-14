@@ -448,8 +448,15 @@ kk_bind_level_tiles(struct kk_bind_batch *b, mtl_texture *texture,
    }
 }
 
-/* Maps a layer's tail from the memory its tiles are bound to, tile by tile */
-static void
+/* Maps a layer's tail from the memory its tiles are bound to. Metal maps each
+ * tile of a 2D tail from a heap tile of its own. It places a 3D tail across
+ * all of its heap tiles at once, which can be more than its region has, and
+ * misplaces or faults on one whose tiles come from several heaps. A 3D tail
+ * maps from the bound memory when it is bound whole to consecutive tiles of
+ * one memory object, and otherwise, while any of it is bound, from a heap of
+ * the image's own.
+ */
+static VkResult
 kk_bind_image_tail(struct kk_bind_batch *b, struct kk_image *image,
                    uint32_t layer)
 {
@@ -459,30 +466,63 @@ kk_bind_image_tail(struct kk_bind_batch *b, struct kk_image *image,
       layer * sparse->layer_tiles + sparse->level_tile[sparse->tail_level];
    const uint64_t end = first + sparse->tail_tiles;
 
-   struct kk_sparse_range *range = kk_sparse_tiles_find(&sparse->tiles, first);
-   uint64_t tile = first;
-   while (tile < end) {
-      /* Unbound up to the next range, then mapped through it */
-      const uint64_t next =
-         range != NULL ? MIN2(MAX2(range->tile, tile), end) : end;
-      if (tile < next) {
-         kk_bind_texture_region(b, plane->mtl_handle, NULL,
-                                (struct mtl_origin){tile - first, 0u, 0u},
-                                (struct mtl_size){next - tile, 1u, 1u},
-                                sparse->tail_level, layer, 0u);
-         tile = next;
-         continue;
-      }
+   if (plane->layout.type != MTL_TEXTURE_TYPE_3D) {
+      struct kk_sparse_range *range =
+         kk_sparse_tiles_find(&sparse->tiles, first);
+      uint64_t tile = first;
+      while (tile < end) {
+         /* Unbound up to the next range, then mapped through it */
+         const uint64_t next =
+            range != NULL ? MIN2(MAX2(range->tile, tile), end) : end;
+         if (tile < next) {
+            kk_bind_texture_region(b, plane->mtl_handle, NULL,
+                                   (struct mtl_origin){tile - first, 0u, 0u},
+                                   (struct mtl_size){next - tile, 1u, 1u},
+                                   sparse->tail_level, layer, 0u);
+            tile = next;
+            continue;
+         }
 
-      const uint64_t last = MIN2(range->tile + range->count, end);
-      kk_bind_texture_region(
-         b, plane->mtl_handle, range->bo->mtl_handle,
-         (struct mtl_origin){tile - first, 0u, 0u},
-         (struct mtl_size){last - tile, 1u, 1u}, sparse->tail_level, layer,
-         range->heap_tile + (tile - range->tile));
-      tile = last;
-      range = kk_sparse_range(rb_node_next(&range->node));
+         const uint64_t last = MIN2(range->tile + range->count, end);
+         kk_bind_texture_region(
+            b, plane->mtl_handle, range->bo->mtl_handle,
+            (struct mtl_origin){tile - first, 0u, 0u},
+            (struct mtl_size){last - tile, 1u, 1u}, sparse->tail_level, layer,
+            range->heap_tile + (tile - range->tile));
+         tile = last;
+         range = kk_sparse_range(rb_node_next(&range->node));
+      }
+      return VK_SUCCESS;
    }
+
+   const struct kk_sparse_range *range =
+      kk_sparse_tiles_find(&sparse->tiles, first);
+   mtl_heap *heap = NULL;
+   uint64_t heap_tile = 0u;
+   if (range != NULL && range->tile <= first &&
+       range->tile + range->count >= end) {
+      heap = range->bo->mtl_handle;
+      heap_tile = range->heap_tile + (first - range->tile);
+   } else if (range != NULL && range->tile < end) {
+      if (sparse->tail_heap == NULL) {
+         sparse->tail_heap = mtl_new_heap(
+            b->dev->mtl_handle,
+            (uint64_t)sparse->tail_tiles * plane->layout.layers *
+               KK_SPARSE_PAGE_SIZE_B,
+            KK_MTL_RESOURCE_OPTIONS, true);
+         if (sparse->tail_heap == NULL)
+            return vk_error(b->dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+         kk_device_add_heap_to_residency_set(b->dev, sparse->tail_heap);
+      }
+      heap = sparse->tail_heap;
+      heap_tile = (uint64_t)layer * sparse->tail_tiles;
+   }
+
+   kk_bind_texture_region(b, plane->mtl_handle, heap,
+                          (struct mtl_origin){0u, 0u, 0u},
+                          (struct mtl_size){sparse->tail_width, 1u, 1u},
+                          sparse->tail_level, layer, heap_tile);
+   return VK_SUCCESS;
 }
 
 /* Binds a range of a sparse image's opaque memory, in tiles. Tails map once
@@ -659,8 +699,11 @@ kk_bind_sparse_image_opaque(struct kk_bind_batch *b,
                                  heap_tile);
    }
 
-   util_dynarray_foreach(&b->tails, uint32_t, layer)
-      kk_bind_image_tail(b, image, *layer);
+   util_dynarray_foreach(&b->tails, uint32_t, layer) {
+      VkResult r = kk_bind_image_tail(b, image, *layer);
+      if (result == VK_SUCCESS)
+         result = r;
+   }
    util_dynarray_clear(&b->tails);
 
    return result;

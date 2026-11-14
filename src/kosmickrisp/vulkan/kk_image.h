@@ -40,6 +40,10 @@ struct kk_image_sparse {
 
    /* First level in the tail, or the level count without a tail */
    uint32_t tail_level;
+
+   /* Tiles of Metal's tail region, and the heap tiles mapping it takes,
+    * which can be more */
+   uint32_t tail_width;
    uint32_t tail_tiles;
 
    /* First tile of each level within a layer, up to the tail's */
@@ -48,6 +52,10 @@ struct kk_image_sparse {
 
    /* What each tile of the image's memory maps from */
    struct kk_sparse_tiles tiles;
+
+   /* Backs a tail that takes more heap tiles than its region while it is
+    * bound to scattered memory, made on the first such bind */
+   mtl_heap *tail_heap;
 };
 
 struct kk_image_plane {
