@@ -777,9 +777,9 @@ kk_get_device_properties(
       .integerDotProduct4x8BitPackedSignedAccelerated = false,
       .integerDotProduct4x8BitPackedMixedSignednessAccelerated = false,
       .storageTexelBufferOffsetAlignmentBytes = KK_MIN_TEXEL_BUFFER_ALIGNMENT,
-      .storageTexelBufferOffsetSingleTexelAlignment = false,
+      .storageTexelBufferOffsetSingleTexelAlignment = true,
       .uniformTexelBufferOffsetAlignmentBytes = KK_MIN_TEXEL_BUFFER_ALIGNMENT,
-      .uniformTexelBufferOffsetSingleTexelAlignment = false,
+      .uniformTexelBufferOffsetSingleTexelAlignment = true,
       .maxBufferSize = pdev->info.max_buffer_size,
 
       /* VK_KHR_push_descriptor */
