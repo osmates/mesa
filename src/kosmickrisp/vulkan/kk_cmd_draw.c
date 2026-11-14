@@ -917,7 +917,8 @@ kk_flush_sample_locations(struct kk_cmd_buffer *cmd)
    if (IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) || IS_DIRTY(RS_LINE_MODE)) {
       bool was_ms_bresenham_lines = render->ms_bresenham_lines;
       render->ms_bresenham_lines =
-         u_reduced_prim(dyn->ia.primitive_topology) == MESA_PRIM_LINES &&
+         u_reduced_prim(vk_topology_to_mesa(dyn->ia.primitive_topology)) ==
+            MESA_PRIM_LINES &&
          dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM &&
          render->samples > 1;
 
