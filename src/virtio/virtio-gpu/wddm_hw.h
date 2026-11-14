@@ -34,6 +34,20 @@
 
 #define VIRTIO_WDDM_MAX_SUBMIT_COMMAND_VIRTUAL_SIZE 8192
 
+/* The rings of a context made by VIRTIO_WDDM_ESCAPE_CONTEXT_INIT_TAG. */
+#define VIRTIO_WDDM_MAX_RINGS 64
+
+/* Node of the context that takes every ring through a hardware queue, on a
+ * driver with hardware queues.
+ */
+#define VIRTIO_WDDM_NODE_HW_QUEUE 1
+
+/* Without hardware queues, ring n has a context of its own on node
+ * VIRTIO_WDDM_NODE_FIRST_RING + n, for n below VIRTIO_WDDM_RING_NODE_COUNT.
+ */
+#define VIRTIO_WDDM_NODE_FIRST_RING 3
+#define VIRTIO_WDDM_RING_NODE_COUNT 61
+
 enum VIRTIO_WDDM_CapsetId
 #if __STDC_VERSION__ >= 202311L
   : uint32_t

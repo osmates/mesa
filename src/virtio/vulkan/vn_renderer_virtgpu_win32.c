@@ -148,14 +148,10 @@ struct virtgpu_exec_context_base {
 #ifdef VIRTUAL_CONTEXT_SUPPORT
 
 /* A driver with hardware queues takes every ring on one context with a
- * hardware queue on node 1.  Without them, each ring gets a context of its
- * own on nodes 3 onwards, since dxgkrnl runs at most two submissions of a
- * context at a time.
+ * hardware queue.  Without them, each ring gets a context of its own on a
+ * node of its own (wddm_hw.h), since dxgkrnl runs at most two submissions
+ * of a context at a time.
  */
-#define VIRTIO_WDDM_HW_QUEUE_TIMELINE_COUNT 64
-#define VIRTIO_WDDM_HW_QUEUE_NODE           1
-#define VIRTIO_WDDM_RING_TIMELINE_COUNT     61
-#define VIRTIO_WDDM_RING_NODE               3
 #define MAX_COMMAND_SIZE           (4096 - 32)
 struct virtgpu_exec_context_virtual {
    struct virtgpu_exec_context_base base;
@@ -205,7 +201,7 @@ struct virtgpu {
 #endif
 #ifndef INDEPENDENT_RENDER_CONTEXT
 #if defined(VIRTUAL_CONTEXT_SUPPORT)
-   struct virtgpu_exec_context_virtual ctx[VIRTIO_WDDM_RING_TIMELINE_COUNT];
+   struct virtgpu_exec_context_virtual ctx[VIRTIO_WDDM_RING_NODE_COUNT];
 #else
    mtx_t ctx_lock;
    struct virtgpu_exec_context ctx[64];
@@ -701,7 +697,7 @@ virtgpu_ioctl_signal_synchronization_object_from_cpu(struct virtgpu *gpu,
          /* This is stupid, but there doesn't seem to be another way */
          struct virtgpu_exec_context_virtual context = {};
          NTSTATUS status = virtgpu_ioctl_create_context_virtual(
-            gpu, VIRTIO_WDDM_HW_QUEUE_NODE, virtgpu_uses_hw_queue(gpu),
+            gpu, VIRTIO_WDDM_NODE_HW_QUEUE, virtgpu_uses_hw_queue(gpu),
             &context);
          if (!NT_SUCCESS(status)) {
             vn_log(gpu->instance, "could create sync context: 0x%lx", status);
@@ -1721,7 +1717,7 @@ static bool
 virtgpu_init_hw_queue(struct virtgpu *gpu)
 {
    NTSTATUS status = virtgpu_ioctl_create_context_virtual(
-      gpu, VIRTIO_WDDM_HW_QUEUE_NODE, true, &gpu->hw_ctx);
+      gpu, VIRTIO_WDDM_NODE_HW_QUEUE, true, &gpu->hw_ctx);
    if (!NT_SUCCESS(status)) {
       if (VN_DEBUG(INIT)) {
          vn_log(gpu->instance, "no hw context (0x%lx), using one per ring",
@@ -1760,7 +1756,7 @@ virtgpu_init_context(struct virtgpu *gpu)
          .tag =
             VIRTIO_WDDM_ESCAPE_CONTEXT_INIT_TAG,
          .capset_id = gpu->capset.id,
-         .num_rings = 64,
+         .num_rings = VIRTIO_WDDM_MAX_RINGS,
          .debug_name = "venus-win32",
       },
    };
@@ -1796,12 +1792,13 @@ virtgpu_init_context(struct virtgpu *gpu)
 #if defined(VIRTUAL_CONTEXT_SUPPORT)
    gpu->use_hw_queue = virtgpu_init_hw_queue(gpu);
    if (gpu->use_hw_queue) {
-      gpu->max_timeline_count = VIRTIO_WDDM_HW_QUEUE_TIMELINE_COUNT;
+      gpu->max_timeline_count = VIRTIO_WDDM_MAX_RINGS;
    } else {
-      gpu->max_timeline_count = VIRTIO_WDDM_RING_TIMELINE_COUNT;
+      STATIC_ASSERT(VIRTIO_WDDM_RING_NODE_COUNT <= VIRTIO_WDDM_MAX_RINGS);
+      gpu->max_timeline_count = VIRTIO_WDDM_RING_NODE_COUNT;
       for (size_t i = 0; i < ARRAY_SIZE(gpu->ctx); i++) {
          status = virtgpu_ioctl_create_context_virtual(
-            gpu, VIRTIO_WDDM_RING_NODE + i, false, &gpu->ctx[i]);
+            gpu, VIRTIO_WDDM_NODE_FIRST_RING + i, false, &gpu->ctx[i]);
          if (!NT_SUCCESS(status)) {
             if (VN_DEBUG(INIT)) {
                vn_log(gpu->instance,
@@ -1905,7 +1902,7 @@ virtgpu_init_params(struct virtgpu *gpu)
    // gpu->supports_cross_device = false;
 
 #if defined(VIRTUAL_CONTEXT_SUPPORT) && defined(INDEPENDENT_RENDER_CONTEXT)
-   gpu->max_timeline_count = VIRTIO_WDDM_RING_TIMELINE_COUNT;
+   gpu->max_timeline_count = VIRTIO_WDDM_RING_NODE_COUNT;
 #elif !defined(VIRTUAL_CONTEXT_SUPPORT)
    gpu->max_timeline_count = VIRTIO_WDDM_TIMELINE_COUNT;
 #endif
@@ -3179,7 +3176,7 @@ virtgpu_submit(struct vn_renderer *renderer,
 #if defined(VIRTUAL_CONTEXT_SUPPORT) && defined(INDEPENDENT_RENDER_CONTEXT)
    struct virtgpu_exec_context_virtual ctx = {};
    NTSTATUS status = virtgpu_ioctl_create_context_virtual(
-      gpu, VIRTIO_WDDM_RING_NODE + batch->ring_idx, false, &ctx);
+      gpu, VIRTIO_WDDM_NODE_FIRST_RING + batch->ring_idx, false, &ctx);
    if (!NT_SUCCESS(status)) {
       vn_log(gpu->instance, "failed to create independent context: 0x%lx",
              status);
@@ -3264,7 +3261,7 @@ virtgpu_submit_wait(struct vn_renderer *renderer,
 #if defined(VIRTUAL_CONTEXT_SUPPORT) && defined(INDEPENDENT_RENDER_CONTEXT)
    struct virtgpu_exec_context_virtual ctx = {};
    NTSTATUS status = virtgpu_ioctl_create_context_virtual(
-      gpu, VIRTIO_WDDM_RING_NODE + batch->ring_idx, false, &ctx);
+      gpu, VIRTIO_WDDM_NODE_FIRST_RING + batch->ring_idx, false, &ctx);
    if (!NT_SUCCESS(status)) {
       vn_log(gpu->instance, "failed to create independent context: 0x%lx",
              status);
