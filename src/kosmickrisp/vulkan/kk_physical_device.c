@@ -568,7 +568,9 @@ kk_get_device_properties(
       .maxImageDimension3D = kk_image_max_dimension(pdev, VK_IMAGE_TYPE_3D),
       .maxImageDimensionCube = kk_image_max_dimension(pdev, VK_IMAGE_TYPE_2D),
       .maxImageArrayLayers = 2048,
-      .maxTexelBufferElements = 16384 * 16384,
+      /* A view's Metal texture can start up to 15 texels before it */
+      .maxTexelBufferElements =
+         16384 * 16384 - (KK_MIN_TEXEL_BUFFER_ALIGNMENT - 1),
       .maxUniformBufferRange = 65536,
       .maxStorageBufferRange = UINT32_MAX,
       .maxPushConstantsSize = KK_MAX_PUSH_SIZE,

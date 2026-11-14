@@ -360,6 +360,35 @@ load_resource_deref_desc(nir_builder *b, unsigned num_components,
                           offset_B, ctx);
 }
 
+static nir_def *
+load_texel_buffer_offset_el(nir_builder *b, nir_deref_instr *deref,
+                            const struct lower_descriptors_ctx *ctx)
+{
+   return load_resource_deref_desc(
+      b, 1, 32, deref, offsetof(struct kk_texel_buffer_descriptor, offset_el),
+      ctx);
+}
+
+/* The Metal texture of a texel buffer view can start before the view. The
+ * add saturates so a negative coordinate stays out of bounds.
+ */
+static nir_def *
+offset_texel_buffer_coord(nir_builder *b, nir_def *coord, nir_def *offset_el)
+{
+   nir_def *x = nir_channel(b, coord, 0);
+   x = nir_uadd_sat(b, x, nir_u2uN(b, offset_el, x->bit_size));
+   return nir_vector_insert_imm(b, coord, x, 0);
+}
+
+static void
+offset_texel_buffer_size(nir_builder *b, nir_def *size, nir_def *offset_el)
+{
+   b->cursor = nir_after_instr(nir_def_instr(size));
+   nir_def *x = nir_channel(b, size, 0);
+   x = nir_isub(b, x, nir_u2uN(b, offset_el, x->bit_size));
+   nir_def_rewrite_uses_after(size, nir_vector_insert_imm(b, size, x, 0));
+}
+
 static bool
 lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
                    const struct lower_descriptors_ctx *ctx)
@@ -393,7 +422,29 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
       .access = nir_intrinsic_access(intr) | var->data.access,
       .flags = msl_convert_access_flag(var->data.access));
 
+   nir_def *offset_el = NULL;
+   if (nir_intrinsic_image_dim(intr) == GLSL_SAMPLER_DIM_BUF)
+      offset_el = load_texel_buffer_offset_el(b, deref, ctx);
+
    nir_rewrite_image_intrinsic(intr, handle, nir_image_intrinsic_type_bindless);
+
+   if (offset_el) {
+      switch (intr->intrinsic) {
+      case nir_intrinsic_bindless_image_load:
+      case nir_intrinsic_bindless_image_sparse_load:
+      case nir_intrinsic_bindless_image_store:
+      case nir_intrinsic_bindless_image_atomic:
+      case nir_intrinsic_bindless_image_atomic_swap:
+         nir_src_rewrite(&intr->src[1], offset_texel_buffer_coord(
+                                           b, intr->src[1].ssa, offset_el));
+         break;
+      case nir_intrinsic_bindless_image_size:
+         offset_texel_buffer_size(b, &intr->def, offset_el);
+         break;
+      default:
+         break;
+      }
+   }
 
    return true;
 }
@@ -602,6 +653,23 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
 
       nir_tex_instr_add_src(tex, nir_tex_src_sampler_handle,
                             nir_load_sampler_handle_kk(b, index));
+   }
+
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
+      nir_def *offset_el = load_texel_buffer_offset_el(
+         b, nir_src_as_deref(nir_src_for_ssa(texture)), ctx);
+
+      int coord_index = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+      if (coord_index >= 0) {
+         nir_src_rewrite(&tex->src[coord_index].src,
+                         offset_texel_buffer_coord(
+                            b, tex->src[coord_index].src.ssa, offset_el));
+      }
+
+      if (tex->op == nir_texop_txs)
+         offset_texel_buffer_size(b, &tex->def, offset_el);
+
+      return true;
    }
 
    if (tex->op == nir_texop_lod) {

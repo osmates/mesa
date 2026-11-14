@@ -134,6 +134,13 @@ mtl_minimum_linear_texture_alignment_for_pixel_format(
    return 0u;
 }
 
+uint64_t
+mtl_minimum_texture_buffer_alignment_for_pixel_format(
+   mtl_device *device, enum mtl_pixel_format format)
+{
+   return 1u;
+}
+
 void
 mtl_heap_texture_size_and_align_with_descriptor(mtl_device *device,
                                                 struct kk_image_layout *layout,

@@ -41,6 +41,33 @@ struct kk_storage_image_descriptor {
 static_assert(sizeof(struct kk_storage_image_descriptor) == 8,
               "kk_storage_image_descriptor has no holes");
 
+struct kk_texel_buffer_descriptor {
+   uint64_t image_gpu_resource_id;
+
+   /* Texels between the aligned start of the Metal texture and the view's
+    * first texel, added to every coordinate in the shader.
+    */
+   uint32_t offset_el;
+   uint32_t pad;
+};
+
+static_assert(sizeof(struct kk_texel_buffer_descriptor) == 16,
+              "kk_texel_buffer_descriptor has no holes");
+
+/* Texel buffers are read through both the sampled and the storage image
+ * paths, which load the resource ID from the start of the descriptor.
+ */
+static_assert(offsetof(struct kk_texel_buffer_descriptor,
+                       image_gpu_resource_id) ==
+                 offsetof(struct kk_sampled_image_descriptor,
+                          image_gpu_resource_id),
+              "texel buffer and sampled image resource IDs match");
+static_assert(offsetof(struct kk_texel_buffer_descriptor,
+                       image_gpu_resource_id) ==
+                 offsetof(struct kk_storage_image_descriptor,
+                          image_gpu_resource_id),
+              "texel buffer and storage image resource IDs match");
+
 /* This has to match nir_address_format_64bit_bounded_global */
 struct kk_buffer_address {
    uint64_t base_addr;
