@@ -58,9 +58,12 @@
 #define DETECT_ARCH_X86 1
 #endif
 
-#if defined(__x86_64__) /* gcc */ || \
+/* ARM64EC code is ARM64 code: clang defines __x86_64__ and __arm64ec__ for
+ * it, MSVC _M_X64 and _M_ARM64EC.
+ */
+#if (defined(__x86_64__) && !defined(__arm64ec__)) /* gcc */ || \
     ((defined(_M_X64) || defined(_M_AMD64)) && !defined(_M_ARM64EC)) /* msvc */ || \
-    defined(__x86_64) /* Sun cc */
+    (defined(__x86_64) && !defined(__arm64ec__)) /* Sun cc */
 #define DETECT_ARCH_X86_64 1
 #endif
 
@@ -87,11 +90,11 @@
 #define DETECT_ARCH_ARM 1
 #endif
 
-#if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC) || defined(__arm64ec__)
 #define DETECT_ARCH_AARCH64 1
 #endif
 
-#if defined(_M_ARM64EC)
+#if defined(_M_ARM64EC) || defined(__arm64ec__)
 #define DETECT_ARCH_ARM64EC 1
 #endif
 

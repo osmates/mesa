@@ -38,7 +38,7 @@ enum blake3_flags {
 #define NOEXCEPT
 #endif
 
-#if (defined(__x86_64__) || defined(_M_X64)) && !defined(_M_ARM64EC)
+#if (defined(__x86_64__) || defined(_M_X64)) && !defined(_M_ARM64EC) && !defined(__arm64ec__)
 #define IS_X86
 #define IS_X86_64
 #endif
@@ -48,7 +48,7 @@ enum blake3_flags {
 #define IS_X86_32
 #endif
 
-#if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC)
+#if defined(__aarch64__) || defined(_M_ARM64) || defined(_M_ARM64EC) || defined(__arm64ec__)
 #define IS_AARCH64
 #endif
 
