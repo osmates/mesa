@@ -14,6 +14,8 @@
 
 #include "vk_buffer_view.h"
 
+#include "util/list.h"
+
 struct kk_physical_device;
 
 VkFormatFeatureFlags2
@@ -26,6 +28,14 @@ struct kk_buffer_view {
 
    /* Texels the Metal texture starts before the view's offset */
    uint32_t offset_el;
+
+   /* A view of a sparse buffer mirrors these tiles of the buffer */
+   struct {
+      struct kk_buffer *buffer;
+      struct list_head link;
+      uint64_t first_tile;
+      uint64_t tile_count;
+   } sparse;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer_view, vk.base, VkBufferView,

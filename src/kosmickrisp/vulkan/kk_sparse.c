@@ -7,6 +7,7 @@
 
 #include "kk_bo.h"
 #include "kk_buffer.h"
+#include "kk_buffer_view.h"
 #include "kk_device.h"
 #include "kk_device_memory.h"
 #include "kk_image.h"
@@ -625,6 +626,30 @@ kk_bo_heap(struct kk_bo *bo)
    return bo ? bo->mtl_handle : NULL;
 }
 
+/* Mirrors a bind of the buffer into its texel buffer views */
+static void
+kk_bind_buffer_views(struct kk_bind_batch *b, struct kk_buffer *buffer,
+                     mtl_heap *heap, uint64_t tile, uint64_t count,
+                     uint64_t heap_tile)
+{
+   const uint64_t end = tile + count;
+
+   list_for_each_entry(struct kk_buffer_view, view, &buffer->sparse.views,
+                       sparse.link) {
+      const uint64_t first = MAX2(tile, view->sparse.first_tile);
+      const uint64_t last =
+         MIN2(end, view->sparse.first_tile + view->sparse.tile_count);
+      if (first >= last)
+         continue;
+
+      kk_bind_texture_region(
+         b, view->mtl_texel_buffer_handle, heap,
+         (struct mtl_origin){first - view->sparse.first_tile, 0u, 0u},
+         (struct mtl_size){last - first, 1u, 1u}, 0u, 0u,
+         heap_tile + (first - tile));
+   }
+}
+
 static VkResult
 kk_bind_sparse_buffer(struct kk_bind_batch *b,
                       const VkSparseBufferMemoryBindInfo *info)
@@ -658,6 +683,7 @@ kk_bind_sparse_buffer(struct kk_bind_batch *b,
 
       kk_bind_buffer_tiles(b, buffer->metal.handle, kk_bo_heap(bo), tile,
                            count, heap_tile);
+      kk_bind_buffer_views(b, buffer, kk_bo_heap(bo), tile, count, heap_tile);
    }
 
    return result;
@@ -842,4 +868,98 @@ kk_queue_bind_sparse(struct kk_queue *queue, struct vk_queue_submit *submit)
    simple_mtx_unlock(&sparse->lock);
 
    return result;
+}
+
+void
+kk_sparse_buffer_init(struct kk_buffer *buffer)
+{
+   kk_sparse_tiles_init(&buffer->sparse.tiles);
+   list_inithead(&buffer->sparse.views);
+}
+
+void
+kk_sparse_buffer_finish(struct kk_device *dev, struct kk_buffer *buffer)
+{
+   if (list_is_empty(&buffer->sparse.views))
+      return;
+
+   simple_mtx_lock(&dev->sparse.lock);
+
+   /* A view can outlive its buffer, but not the buffer's tiles */
+   if (dev->sparse.enabled && dev->has_queue) {
+      struct kk_bind_batch b = {
+         .dev = dev,
+         .queue = &dev->queue,
+         .ops = UTIL_DYNARRAY_INIT,
+         .tails = UTIL_DYNARRAY_INIT,
+      };
+      list_for_each_entry(struct kk_buffer_view, view, &buffer->sparse.views,
+                          sparse.link) {
+         kk_bind_texture_region(
+            &b, view->mtl_texel_buffer_handle, NULL,
+            (struct mtl_origin){0u, 0u, 0u},
+            (struct mtl_size){view->sparse.tile_count, 1u, 1u}, 0u, 0u, 0u);
+      }
+      kk_bind_batch_end(&b);
+   }
+
+   list_for_each_entry_safe(struct kk_buffer_view, view, &buffer->sparse.views,
+                            sparse.link) {
+      list_del(&view->sparse.link);
+      view->sparse.buffer = NULL;
+   }
+
+   simple_mtx_unlock(&dev->sparse.lock);
+}
+
+void
+kk_sparse_buffer_add_view(struct kk_device *dev, struct kk_buffer *buffer,
+                          struct kk_buffer_view *view)
+{
+   simple_mtx_lock(&dev->sparse.lock);
+
+   view->sparse.buffer = buffer;
+   list_addtail(&view->sparse.link, &buffer->sparse.views);
+
+   /* Map the tiles the buffer has now. Binds after this map them too. */
+   if (!rb_tree_is_empty(&buffer->sparse.tiles.ranges)) {
+      struct kk_bind_batch b = {
+         .dev = dev,
+         .queue = &dev->queue,
+         .ops = UTIL_DYNARRAY_INIT,
+         .tails = UTIL_DYNARRAY_INIT,
+      };
+
+      const uint64_t first = view->sparse.first_tile;
+      const uint64_t end = first + view->sparse.tile_count;
+      for (struct kk_sparse_range *range =
+              kk_sparse_tiles_find(&buffer->sparse.tiles, first);
+           range != NULL && range->tile < end;
+           range = kk_sparse_range(rb_node_next(&range->node))) {
+         const uint64_t lo = MAX2(range->tile, first);
+         const uint64_t hi = MIN2(range->tile + range->count, end);
+         kk_bind_texture_region(&b, view->mtl_texel_buffer_handle,
+                                range->bo->mtl_handle,
+                                (struct mtl_origin){lo - first, 0u, 0u},
+                                (struct mtl_size){hi - lo, 1u, 1u}, 0u, 0u,
+                                range->heap_tile + (lo - range->tile));
+      }
+
+      kk_bind_batch_end(&b);
+   }
+
+   simple_mtx_unlock(&dev->sparse.lock);
+}
+
+void
+kk_sparse_buffer_remove_view(struct kk_device *dev, struct kk_buffer_view *view)
+{
+   simple_mtx_lock(&dev->sparse.lock);
+
+   if (view->sparse.buffer != NULL) {
+      list_del(&view->sparse.link);
+      view->sparse.buffer = NULL;
+   }
+
+   simple_mtx_unlock(&dev->sparse.lock);
 }

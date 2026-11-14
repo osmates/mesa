@@ -82,6 +82,10 @@ mtl_buffer *mtl_new_placement_sparse_buffer(mtl_device *device,
 mtl_texture *
 mtl_new_placement_sparse_texture(mtl_device *device,
                                  const struct kk_image_layout *layout);
+/* Its tiles all form the tail, laid out linearly from texel 0 */
+mtl_texture *mtl_new_placement_sparse_texture_buffer(
+   mtl_device *device, enum mtl_pixel_format format, uint64_t width,
+   enum mtl_texture_usage usage);
 mtl_command_allocator *mtl_new_command_allocator(mtl_device *device);
 mtl_command_buffer *mtl_new_command_buffer(mtl_device *device);
 

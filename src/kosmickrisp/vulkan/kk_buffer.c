@@ -58,7 +58,7 @@ kk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       buffer->metal.offset = 0u;
       buffer->vk.device_address =
          mtl_buffer_get_gpu_address(buffer->metal.handle);
-      kk_sparse_tiles_init(&buffer->sparse.tiles);
+      kk_sparse_buffer_init(buffer);
 
       kk_device_add_buffer_to_residency_set(dev, buffer->metal.handle);
    }
@@ -78,8 +78,10 @@ kk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
    if (!buffer)
       return;
 
-   if (kk_buffer_is_sparse(buffer))
+   if (kk_buffer_is_sparse(buffer)) {
+      kk_sparse_buffer_finish(dev, buffer);
       kk_device_remove_buffer_from_residency_set(dev, buffer->metal.handle);
+   }
 
    if (buffer->metal.handle)
       mtl_release(buffer->metal.handle);

@@ -16,6 +16,8 @@
 
 #include "vk_buffer.h"
 
+#include "util/list.h"
+
 struct kk_buffer {
    struct vk_buffer vk;
 
@@ -26,9 +28,12 @@ struct kk_buffer {
       uint64_t offset;
    } metal;
 
-   /* What a sparse buffer's tiles map from */
+   /* Metal has no texture buffer over a placement sparse buffer, so each
+    * texel buffer view of a sparse buffer is a placement sparse texture buffer
+    * mapped to the same heap tiles as the buffer. */
    struct {
       struct kk_sparse_tiles tiles;
+      struct list_head views;
    } sparse;
 };
 

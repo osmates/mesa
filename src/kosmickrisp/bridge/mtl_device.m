@@ -414,6 +414,25 @@ mtl_new_placement_sparse_texture(mtl_device *device,
    }
 }
 
+mtl_texture *
+mtl_new_placement_sparse_texture_buffer(mtl_device *device,
+                                        enum mtl_pixel_format format,
+                                        uint64_t width,
+                                        enum mtl_texture_usage usage)
+{
+   @autoreleasepool {
+      id<MTLDevice> dev = (id<MTLDevice>)device;
+      MTLTextureDescriptor *descriptor = [MTLTextureDescriptor
+         textureBufferDescriptorWithPixelFormat:(MTLPixelFormat)format
+                                          width:width
+                                resourceOptions:MTLResourceStorageModePrivate |
+                                                MTLResourceHazardTrackingModeUntracked
+                                          usage:(MTLTextureUsage)usage];
+      descriptor.placementSparsePageSize = MTLSparsePageSize64;
+      return [dev newTextureWithDescriptor:descriptor];
+   }
+}
+
 mtl_buffer *
 mtl_new_buffer_with_bytes_no_copy(mtl_device *device, void* ptr,
                                   uint64_t size_B)

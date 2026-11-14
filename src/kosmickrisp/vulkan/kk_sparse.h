@@ -15,6 +15,8 @@
 #include "util/u_dynarray.h"
 
 struct kk_bo;
+struct kk_buffer;
+struct kk_buffer_view;
 struct kk_device;
 struct kk_queue;
 struct vk_queue_submit;
@@ -72,5 +74,13 @@ void kk_sparse_tiles_finish(struct kk_device *dev,
 /* False when memory can go now, true when sparse tiles still map it and it
  * goes with the last of them */
 bool kk_sparse_keep_memory(struct kk_device *dev, struct kk_bo *bo);
+
+void kk_sparse_buffer_init(struct kk_buffer *buffer);
+void kk_sparse_buffer_finish(struct kk_device *dev, struct kk_buffer *buffer);
+
+void kk_sparse_buffer_add_view(struct kk_device *dev, struct kk_buffer *buffer,
+                               struct kk_buffer_view *view);
+void kk_sparse_buffer_remove_view(struct kk_device *dev,
+                                  struct kk_buffer_view *view);
 
 #endif /* KK_SPARSE_H */

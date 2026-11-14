@@ -82,6 +82,41 @@ kk_get_buffer_format_features(struct kk_physical_device *pdev,
    return features;
 }
 
+/* Metal makes no texture buffer over a placement sparse buffer. A view of one
+ * is a placement sparse texture buffer of its own, from the tile that holds
+ * the view's first texel, whose tiles map to the same heap tiles as the
+ * buffer's.
+ */
+static VkResult
+kk_create_sparse_buffer_view(struct kk_device *dev, struct kk_buffer *buffer,
+                             struct kk_buffer_view *view,
+                             const struct kk_va_format *format,
+                             enum mtl_texture_usage usage, unsigned texel_B,
+                             uint64_t offset_B)
+{
+   const uint64_t skip_B = offset_B % KK_SPARSE_PAGE_SIZE_B;
+
+   /* Tiles do not split into whole texels of 3-component formats */
+   if (skip_B % texel_B != 0)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   view->offset_el = skip_B / texel_B;
+   view->sparse.first_tile = offset_B / KK_SPARSE_PAGE_SIZE_B;
+   view->sparse.tile_count =
+      DIV_ROUND_UP(skip_B + view->vk.range, KK_SPARSE_PAGE_SIZE_B);
+
+   view->mtl_texel_buffer_handle = mtl_new_placement_sparse_texture_buffer(
+      dev->mtl_handle, format->mtl_pixel_format,
+      view->offset_el + view->vk.elements, usage);
+   if (view->mtl_texel_buffer_handle == NULL)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   kk_device_add_texture_to_residency_set(dev, view->mtl_texel_buffer_handle);
+   kk_sparse_buffer_add_view(dev, buffer, view);
+
+   return VK_SUCCESS;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
                     const VkAllocationCallbacks *pAllocator,
@@ -110,6 +145,21 @@ kk_CreateBufferView(VkDevice _device, const VkBufferViewCreateInfo *pCreateInfo,
    struct kk_buffer *buffer =
       container_of(view->vk.buffer, struct kk_buffer, vk);
    const uint64_t offset_B = kk_buffer_mtl_offset(buffer, view->vk.offset);
+
+   if (kk_buffer_is_sparse(buffer)) {
+      VkResult result = kk_create_sparse_buffer_view(
+         dev, buffer, view, supported_format, usage,
+         util_format_get_blocksize(p_format), offset_B);
+      if (result != VK_SUCCESS) {
+         vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
+         return result;
+      }
+
+      view->texel_buffer_gpu_id =
+         mtl_texture_get_gpu_resource_id(view->mtl_texel_buffer_handle);
+      *pBufferView = kk_buffer_view_to_handle(view);
+      return VK_SUCCESS;
+   }
 
    /* Metal needs a texture buffer's offset aligned to more than a texel.
     * Start the texture at the aligned offset below the view's and skip the
@@ -165,6 +215,12 @@ kk_DestroyBufferView(VkDevice _device, VkBufferView bufferView,
 
    if (!view)
       return;
+
+   if (view->sparse.tile_count > 0u) {
+      kk_sparse_buffer_remove_view(dev, view);
+      kk_device_remove_texture_from_residency_set(
+         dev, view->mtl_texel_buffer_handle);
+   }
 
    mtl_release(view->mtl_texel_buffer_handle);
    vk_buffer_view_destroy(&dev->vk, pAllocator, &view->vk);
