@@ -260,6 +260,59 @@ kk_image_max_dimension(const struct kk_physical_device *pdev,
    }
 }
 
+#define KK_IMAGE_CREATE_SPARSE_FLAGS                                           \
+   (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |                                       \
+    VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)
+
+/* Sparse images are single sample 2D colour or depth-only images with optimal
+ * tiling, backed by placement sparse textures.
+ */
+static bool
+kk_image_supports_sparse(struct kk_physical_device *pdev,
+                         const VkPhysicalDeviceImageFormatInfo2 *info,
+                         VkImageUsageFlags2KHR usage,
+                         const VkPhysicalDeviceExternalImageFormatInfo *external)
+{
+   const struct vk_features *features = &pdev->vk.supported_features;
+
+   if (!features->sparseBinding)
+      return false;
+
+   if ((info->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) &&
+       !features->sparseResidencyImage2D)
+      return false;
+
+   if ((info->flags & VK_IMAGE_CREATE_SPARSE_ALIASED_BIT) &&
+       !features->sparseResidencyAliased)
+      return false;
+
+   if (info->type != VK_IMAGE_TYPE_2D ||
+       info->tiling != VK_IMAGE_TILING_OPTIMAL)
+      return false;
+
+   /* Block texel views alias subresources at heap offsets, and host copies
+    * and external memory need memory of the image's own. */
+   if ((info->flags & VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT) ||
+       (usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT) ||
+       (external != NULL && external->handleType != 0))
+      return false;
+
+   if (vk_format_get_ycbcr_info(info->format) != NULL ||
+       vk_format_has_stencil(info->format))
+      return false;
+
+   const enum pipe_format p_format = vk_format_to_pipe_format(info->format);
+   const struct kk_va_format *va_format = kk_get_va_format(p_format);
+   if (va_format == NULL ||
+       (!vk_format_has_depth(info->format) && !va_format->sparse))
+      return false;
+
+   const struct mtl_size tile =
+      mtl_placement_sparse_tile_size(pdev->mtl_dev_handle, MTL_TEXTURE_TYPE_2D,
+                                     va_format->mtl_pixel_format, 1u);
+   return tile.x != 0 && tile.y != 0 && tile.z != 0;
+}
+
 VKAPI_ATTR VkResult VKAPI_CALL
 kk_GetPhysicalDeviceImageFormatProperties2(
    VkPhysicalDevice physicalDevice,
@@ -336,8 +389,9 @@ kk_GetPhysicalDeviceImageFormatProperties2(
    if (ycbcr_info && pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-   /* Don't support sparse residency */
-   if ((pImageFormatInfo->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT))
+   if ((pImageFormatInfo->flags & KK_IMAGE_CREATE_SPARSE_FLAGS) &&
+       !kk_image_supports_sparse(pdev, pImageFormatInfo, all_usage,
+                                 external_info))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    /* From the Vulkan 1.3.279 spec:
@@ -410,7 +464,8 @@ kk_GetPhysicalDeviceImageFormatProperties2(
    }
 
    VkSampleCountFlags sampleCounts = VK_SAMPLE_COUNT_1_BIT;
-   if (pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL &&
+   if (!(pImageFormatInfo->flags & KK_IMAGE_CREATE_SPARSE_FLAGS) &&
+       pImageFormatInfo->tiling == VK_IMAGE_TILING_OPTIMAL &&
        pImageFormatInfo->type == VK_IMAGE_TYPE_2D && ycbcr_info == NULL &&
        (features & (VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT |
                     VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT)) &&
@@ -572,6 +627,48 @@ kk_GetPhysicalDeviceSparseImageFormatProperties2(
    return;
 }
 
+/* A sparse image's texture exists from the start, without memory. Its tiles
+ * give the image's memory size, and its tail depends on the image's usage.
+ */
+static VkResult
+kk_image_plane_init_sparse(struct kk_device *dev, struct kk_image_plane *plane)
+{
+   struct kk_image_layout *layout = &plane->layout;
+   struct kk_image_sparse *sparse = &plane->sparse;
+
+   plane->mtl_handle =
+      mtl_new_placement_sparse_texture(dev->mtl_handle, layout);
+   if (plane->mtl_handle == NULL)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   sparse->tile_px = mtl_placement_sparse_tile_size(
+      dev->mtl_handle, layout->type, layout->format.mtl,
+      layout->sample_count_sa);
+   kk_sparse_tiles_init(&sparse->tiles);
+   sparse->tail_level =
+      MIN2(mtl_texture_first_mipmap_in_tail(plane->mtl_handle), layout->levels);
+   sparse->tail_tiles =
+      sparse->tail_level < layout->levels
+         ? DIV_ROUND_UP(mtl_texture_tail_size_in_bytes(plane->mtl_handle),
+                        KK_SPARSE_PAGE_SIZE_B)
+         : 0u;
+
+   uint64_t tiles = 0u;
+   for (uint32_t level = 0u; level < sparse->tail_level; level++) {
+      sparse->level_tile[level] = tiles;
+      const struct mtl_size n = kk_image_sparse_level_tiles(plane, level);
+      tiles += n.x * n.y * n.z;
+   }
+   sparse->level_tile[sparse->tail_level] = tiles;
+   sparse->layer_tiles = tiles + sparse->tail_tiles;
+
+   layout->size_B =
+      sparse->layer_tiles * layout->layers * KK_SPARSE_PAGE_SIZE_B;
+   layout->align_B = KK_SPARSE_PAGE_SIZE_B;
+
+   return VK_SUCCESS;
+}
+
 static VkResult
 kk_image_init(struct kk_device *dev, struct kk_image *image,
               const VkImageCreateInfo *pCreateInfo)
@@ -613,6 +710,13 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
       kk_image_layout_init(dev, &image->vk, vk_format_to_pipe_format(format),
                            width_scale, height_scale,
                            &image->planes[plane].layout);
+   }
+
+   if (kk_image_is_sparse(image)) {
+      assert(image->plane_count == 1);
+      VkResult result = kk_image_plane_init_sparse(dev, &image->planes[0]);
+      if (result != VK_SUCCESS)
+         return result;
    }
 
    return VK_SUCCESS;
@@ -670,9 +774,13 @@ kk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
 
    result = kk_image_init(dev, image, pCreateInfo);
    if (result != VK_SUCCESS) {
+      kk_image_finish(dev, image, pAllocator);
       vk_free2(&dev->vk.alloc, pAllocator, image);
       return result;
    }
+
+   if (kk_image_is_sparse(image))
+      kk_device_add_texture_to_residency_set(dev, image->planes[0].mtl_handle);
 
    *pImage = kk_image_to_handle(image);
 
@@ -689,7 +797,16 @@ kk_DestroyImage(VkDevice device, VkImage _image,
    if (!image)
       return;
 
+   if (kk_image_is_sparse(image))
+      kk_device_remove_texture_from_residency_set(dev,
+                                                  image->planes[0].mtl_handle);
+
    kk_image_finish(dev, image, pAllocator);
+
+   /* Freed memory its tiles mapped can go once the texture is gone */
+   if (kk_image_is_sparse(image))
+      kk_sparse_tiles_finish(dev, &image->planes[0].sparse.tiles);
+
    vk_free2(&dev->vk.alloc, pAllocator, image);
 }
 

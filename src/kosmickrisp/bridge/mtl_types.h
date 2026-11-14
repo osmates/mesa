@@ -10,6 +10,7 @@
 #ifndef KK_MTL_TYPES_H
 #define KK_MTL_TYPES_H 1
 
+#include <stdbool.h>
 #include <stddef.h> /* For size_t definition */
 
 /** HANDLES */
@@ -391,6 +392,26 @@ struct mtl_texture_memory_copy {
    size_t buffer_2d_image_size_B;
    size_t image_slice;
    size_t image_level;
+};
+
+/* Placement sparse mapping updates, in tiles. heap_tile is ignored on unmap. */
+struct mtl_buffer_mapping {
+   size_t tile;
+   size_t tile_count;
+   size_t heap_tile;
+   bool map;
+};
+
+/* For the tail, origin is (first tile, 0, 0) and size (tiles, 1, 1) at the
+ * texture's first level in the tail.
+ */
+struct mtl_texture_mapping {
+   struct mtl_origin origin;
+   struct mtl_size size;
+   size_t level;
+   size_t slice;
+   size_t heap_tile;
+   bool map;
 };
 
 struct mtl_feedback_data {

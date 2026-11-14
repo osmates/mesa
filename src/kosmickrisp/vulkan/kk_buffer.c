@@ -46,6 +46,23 @@ kk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
    if (!buffer)
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
+   /* A sparse buffer is a placement sparse buffer from the start. Its address
+    * holds before any bind, and vkQueueBindSparse maps heap tiles into it. */
+   if (kk_buffer_is_sparse(buffer)) {
+      buffer->metal.handle = mtl_new_placement_sparse_buffer(
+         dev->mtl_handle, align64(buffer->vk.size, KK_SPARSE_PAGE_SIZE_B));
+      if (buffer->metal.handle == NULL) {
+         vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+      }
+      buffer->metal.offset = 0u;
+      buffer->vk.device_address =
+         mtl_buffer_get_gpu_address(buffer->metal.handle);
+      kk_sparse_tiles_init(&buffer->sparse.tiles);
+
+      kk_device_add_buffer_to_residency_set(dev, buffer->metal.handle);
+   }
+
    *pBuffer = kk_buffer_to_handle(buffer);
 
    return VK_SUCCESS;
@@ -61,8 +78,15 @@ kk_DestroyBuffer(VkDevice device, VkBuffer _buffer,
    if (!buffer)
       return;
 
+   if (kk_buffer_is_sparse(buffer))
+      kk_device_remove_buffer_from_residency_set(dev, buffer->metal.handle);
+
    if (buffer->metal.handle)
       mtl_release(buffer->metal.handle);
+
+   /* Freed memory its tiles mapped can go once the buffer is gone */
+   if (kk_buffer_is_sparse(buffer))
+      kk_sparse_tiles_finish(dev, &buffer->sparse.tiles);
 
    vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
 }
@@ -75,9 +99,13 @@ kk_GetDeviceBufferMemoryRequirements(
    VK_FROM_HANDLE(kk_device, dev, device);
    struct kk_physical_device *pdev = kk_device_physical(dev);
 
-   const uint64_t alignment = kk_get_buffer_alignment(
-      pdev, pInfo->pCreateInfo->size, pInfo->pCreateInfo->usage,
-      pInfo->pCreateInfo->flags);
+   /* Sparse buffers bind whole tiles */
+   const uint64_t alignment =
+      (pInfo->pCreateInfo->flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
+         ? KK_SPARSE_PAGE_SIZE_B
+         : kk_get_buffer_alignment(pdev, pInfo->pCreateInfo->size,
+                                   pInfo->pCreateInfo->usage,
+                                   pInfo->pCreateInfo->flags);
 
    pMemoryRequirements->memoryRequirements = (VkMemoryRequirements){
       .size = align64(pInfo->pCreateInfo->size, alignment),

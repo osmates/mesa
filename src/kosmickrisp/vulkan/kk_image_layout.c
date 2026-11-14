@@ -84,6 +84,10 @@ kk_image_layout_can_optimize(const struct kk_physical_device *pdev,
    if (tiling != VK_IMAGE_TILING_OPTIMAL)
       return false;
 
+   /* Tiles of a sparse image can alias other resources' memory */
+   if (flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
+      return false;
+
    /* Cannot optimize if host transfer for a format that would use Apple's
     * lossless compression. Otherwise, CTS tests which populate memory with
     * random data fail due to differences in how invalid optimized data is

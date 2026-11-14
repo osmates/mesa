@@ -12,6 +12,7 @@
 
 #include "kk_query_table.h"
 #include "kk_queue.h"
+#include "kk_sparse.h"
 
 #include "kosmickrisp/bridge/mtl_types.h"
 
@@ -99,6 +100,8 @@ struct kk_device {
    bool has_queue;
    struct kk_queue queue;
 
+   struct kk_sparse_device sparse;
+
    struct vk_meta_device meta;
 
    /* Geomtry heap */
@@ -127,6 +130,10 @@ void kk_device_add_buffer_to_residency_set(struct kk_device *dev,
                                            mtl_buffer *buffer);
 void kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
                                                 mtl_buffer *buffer);
+void kk_device_add_texture_to_residency_set(struct kk_device *dev,
+                                            mtl_texture *texture);
+void kk_device_remove_texture_from_residency_set(struct kk_device *dev,
+                                                 mtl_texture *texture);
 void kk_device_make_resources_resident(struct kk_device *dev);
 
 /* Required to create a sampler */

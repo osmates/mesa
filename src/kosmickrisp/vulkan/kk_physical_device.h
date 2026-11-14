@@ -48,6 +48,7 @@ struct kk_device_info {
    VkSampleCountFlags supported_sample_counts;
    bool supports_bc_texture_compression;
    bool supports_32_bit_float_filtering;
+   bool supports_placement_sparse;
 };
 
 struct kk_env_settings {

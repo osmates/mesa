@@ -15,7 +15,7 @@
 /* Creation */
 mtl_heap *
 mtl_new_heap(mtl_device *device, uint64_t size,
-             enum mtl_resource_options resource_options)
+             enum mtl_resource_options resource_options, bool sparse_tiles)
 {
    @autoreleasepool {
       id<MTLDevice> dev = (id<MTLDevice>)device;
@@ -23,7 +23,8 @@ mtl_new_heap(mtl_device *device, uint64_t size,
       descriptor.type = MTLHeapTypePlacement;
       descriptor.resourceOptions = (MTLResourceOptions)resource_options;
       descriptor.size = size;
-      descriptor.sparsePageSize = MTLSparsePageSize16;
+      if (sparse_tiles)
+         descriptor.maxCompatiblePlacementSparsePageSize = MTLSparsePageSize64;
       return [dev newHeapWithDescriptor:descriptor];
    }
 }

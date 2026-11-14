@@ -10,6 +10,7 @@
 
 #include "kk_device_memory.h"
 #include "kk_private.h"
+#include "kk_sparse.h"
 
 #include "kosmickrisp/bridge/mtl_types.h"
 
@@ -24,6 +25,11 @@ struct kk_buffer {
        * offset calculations through kk_buffer_mtl_offset */
       uint64_t offset;
    } metal;
+
+   /* What a sparse buffer's tiles map from */
+   struct {
+      struct kk_sparse_tiles tiles;
+   } sparse;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer, vk.base, VkBuffer,
@@ -40,6 +46,12 @@ kk_buffer_addr_range(const struct kk_buffer *buffer, uint64_t offset,
       .addr = vk_buffer_address(&buffer->vk, offset),
       .range = vk_buffer_range(&buffer->vk, offset, range),
    };
+}
+
+static inline bool
+kk_buffer_is_sparse(const struct kk_buffer *buffer)
+{
+   return buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT;
 }
 
 static inline uint64_t

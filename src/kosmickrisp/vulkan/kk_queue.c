@@ -189,6 +189,13 @@ kk_queue_submit(struct vk_queue *vk_queue, struct vk_queue_submit *submit)
       mtl_wait_for_event(queue->mtl_handle, sync->mtl_handle, wait->wait_value);
    }
 
+   /* Mapping updates wait for the waits above */
+   if (vk_queue_submit_has_bind(submit)) {
+      VkResult result = kk_queue_bind_sparse(queue, submit);
+      if (result != VK_SUCCESS)
+         return result;
+   }
+
    /* Ensure any changes to residency are propagated before we submit any
     * work. All resources should have been allocated before submission.
     * Otherwise, users are playing with fire. */

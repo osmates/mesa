@@ -8,6 +8,9 @@
 
 #include <Metal/MTLDevice.h>
 #include <Metal/MTLCommandQueue.h>
+#include <Metal/MTL4CommandQueue.h>
+
+#include <stdlib.h>
 
 /* MTL4CommitOptions */
 mtl_commit_options *
@@ -106,6 +109,69 @@ mtl_command_queue_commit(mtl_command_queue *queue,
       id<MTL4CommandBuffer> *cmds = (id<MTL4CommandBuffer> *)command_buffers;
       MTL4CommitOptions *opt = (MTL4CommitOptions *)options;
       [q commit:cmds count:count options:opt];
+   }
+}
+
+void
+mtl_command_queue_update_buffer_mappings(
+   mtl_command_queue *queue, mtl_buffer *buffer, mtl_heap *heap,
+   const struct mtl_buffer_mapping *mappings, uint32_t count)
+{
+   @autoreleasepool {
+      id<MTL4CommandQueue> q = (id<MTL4CommandQueue>)queue;
+      MTL4UpdateSparseBufferMappingOperation *ops =
+         malloc(count * sizeof(*ops));
+      if (ops == NULL)
+         return;
+
+      for (uint32_t i = 0u; i < count; ++i) {
+         ops[i] = (MTL4UpdateSparseBufferMappingOperation){
+            .mode = mappings[i].map ? MTLSparseTextureMappingModeMap
+                                    : MTLSparseTextureMappingModeUnmap,
+            .bufferRange = NSMakeRange(mappings[i].tile, mappings[i].tile_count),
+            .heapOffset = mappings[i].heap_tile,
+         };
+      }
+
+      [q updateBufferMappings:(id<MTLBuffer>)buffer
+                         heap:(id<MTLHeap>)heap
+                   operations:ops
+                        count:count];
+      free(ops);
+   }
+}
+
+void
+mtl_command_queue_update_texture_mappings(
+   mtl_command_queue *queue, mtl_texture *texture, mtl_heap *heap,
+   const struct mtl_texture_mapping *mappings, uint32_t count)
+{
+   @autoreleasepool {
+      id<MTL4CommandQueue> q = (id<MTL4CommandQueue>)queue;
+      MTL4UpdateSparseTextureMappingOperation *ops =
+         malloc(count * sizeof(*ops));
+      if (ops == NULL)
+         return;
+
+      for (uint32_t i = 0u; i < count; ++i) {
+         const struct mtl_texture_mapping *m = &mappings[i];
+         ops[i] = (MTL4UpdateSparseTextureMappingOperation){
+            .mode = m->map ? MTLSparseTextureMappingModeMap
+                           : MTLSparseTextureMappingModeUnmap,
+            .textureRegion = MTLRegionMake3D(m->origin.x, m->origin.y,
+                                             m->origin.z, m->size.x,
+                                             m->size.y, m->size.z),
+            .textureLevel = m->level,
+            .textureSlice = m->slice,
+            .heapOffset = m->heap_tile,
+         };
+      }
+
+      [q updateTextureMappings:(id<MTLTexture>)texture
+                          heap:(id<MTLHeap>)heap
+                    operations:ops
+                         count:count];
+      free(ops);
    }
 }
 

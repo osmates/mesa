@@ -1,0 +1,706 @@
+/*
+ * Copyright 2026 Ngo Quoc Dat
+ * SPDX-License-Identifier: MIT
+ */
+
+#include "kk_sparse.h"
+
+#include "kk_bo.h"
+#include "kk_buffer.h"
+#include "kk_device.h"
+#include "kk_device_memory.h"
+#include "kk_image.h"
+#include "kk_queue.h"
+
+#include "kosmickrisp/bridge/mtl_bridge.h"
+
+#include "vk_alloc.h"
+#include "vk_log.h"
+#include "vk_queue.h"
+
+VkResult
+kk_device_init_sparse(struct kk_device *dev)
+{
+   struct kk_sparse_device *sparse = &dev->sparse;
+
+   simple_mtx_init(&sparse->lock, mtx_plain);
+   sparse->released = UTIL_DYNARRAY_INIT;
+
+   if (!dev->vk.enabled_features.sparseBinding)
+      return VK_SUCCESS;
+
+   sparse->enabled = true;
+   sparse->remap_heap = mtl_new_heap(dev->mtl_handle, KK_SPARSE_PAGE_SIZE_B,
+                                     KK_MTL_RESOURCE_OPTIONS, true);
+   sparse->remap_buffer =
+      mtl_new_placement_sparse_buffer(dev->mtl_handle, KK_SPARSE_PAGE_SIZE_B);
+   sparse->event = mtl_new_event(dev->mtl_handle);
+   if (!sparse->remap_heap || !sparse->remap_buffer || !sparse->event) {
+      kk_device_finish_sparse(dev);
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+   }
+
+   kk_device_add_heap_to_residency_set(dev, sparse->remap_heap);
+   kk_device_add_buffer_to_residency_set(dev, sparse->remap_buffer);
+
+   return VK_SUCCESS;
+}
+
+static void
+kk_sparse_release_memory(struct kk_device *dev)
+{
+   util_dynarray_foreach(&dev->sparse.released, struct kk_bo *, bo)
+      kk_destroy_bo(dev, *bo);
+   util_dynarray_clear(&dev->sparse.released);
+}
+
+void
+kk_device_finish_sparse(struct kk_device *dev)
+{
+   struct kk_sparse_device *sparse = &dev->sparse;
+
+   if (sparse->remap_buffer) {
+      kk_device_remove_buffer_from_residency_set(dev, sparse->remap_buffer);
+      mtl_release(sparse->remap_buffer);
+   }
+   if (sparse->remap_heap) {
+      kk_device_remove_heap_from_residency_set(dev, sparse->remap_heap);
+      mtl_release(sparse->remap_heap);
+   }
+   if (sparse->event)
+      mtl_release(sparse->event);
+
+   kk_sparse_release_memory(dev);
+   util_dynarray_fini(&sparse->released);
+   simple_mtx_destroy(&sparse->lock);
+
+   *sparse = (struct kk_sparse_device){0};
+}
+
+static void
+kk_sparse_unref_memory(struct kk_device *dev, struct kk_bo *bo,
+                       uint64_t tiles)
+{
+   assert(bo->sparse_refs >= tiles);
+   bo->sparse_refs -= tiles;
+   if (bo->sparse_refs == 0u && bo->sparse_freed)
+      util_dynarray_append(&dev->sparse.released, bo);
+}
+
+bool
+kk_sparse_keep_memory(struct kk_device *dev, struct kk_bo *bo)
+{
+   simple_mtx_lock(&dev->sparse.lock);
+   const bool keep = bo->sparse_refs > 0u;
+   bo->sparse_freed = keep;
+   simple_mtx_unlock(&dev->sparse.lock);
+
+   return keep;
+}
+
+static struct kk_sparse_range *
+kk_sparse_range(const struct rb_node *node)
+{
+   return node ? rb_node_data(struct kk_sparse_range, node, node) : NULL;
+}
+
+/* rb_tree goes left when this is negative */
+static int
+kk_sparse_range_cmp(const struct rb_node *a, const struct rb_node *b)
+{
+   return kk_sparse_range(b)->tile < kk_sparse_range(a)->tile ? -1 : 1;
+}
+
+/* The first range that ends after the tile */
+static struct kk_sparse_range *
+kk_sparse_tiles_find(const struct kk_sparse_tiles *tiles, uint64_t tile)
+{
+   struct rb_node *found = NULL;
+   struct rb_node *node = tiles->ranges.root;
+   while (node != NULL) {
+      const struct kk_sparse_range *range = kk_sparse_range(node);
+      if (range->tile + range->count > tile) {
+         found = node;
+         node = node->left;
+      } else {
+         node = node->right;
+      }
+   }
+
+   return kk_sparse_range(found);
+}
+
+void
+kk_sparse_tiles_init(struct kk_sparse_tiles *tiles)
+{
+   rb_tree_init(&tiles->ranges);
+}
+
+void
+kk_sparse_tiles_finish(struct kk_device *dev, struct kk_sparse_tiles *tiles)
+{
+   if (rb_tree_is_empty(&tiles->ranges))
+      return;
+
+   simple_mtx_lock(&dev->sparse.lock);
+   while (!rb_tree_is_empty(&tiles->ranges)) {
+      struct kk_sparse_range *range =
+         kk_sparse_range(rb_tree_first(&tiles->ranges));
+      kk_sparse_unref_memory(dev, range->bo, range->count);
+      rb_tree_remove(&tiles->ranges, &range->node);
+      vk_free(&dev->vk.alloc, range);
+   }
+   kk_sparse_release_memory(dev);
+   simple_mtx_unlock(&dev->sparse.lock);
+}
+
+static struct kk_sparse_range *
+kk_sparse_range_alloc(struct kk_device *dev)
+{
+   return vk_zalloc(&dev->vk.alloc, sizeof(struct kk_sparse_range), 8,
+                    VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+}
+
+/* Records that tiles [tile, tile + count) map heap tiles of bo from
+ * heap_tile on, or nothing when bo is NULL. Nothing changes when it fails.
+ */
+static bool
+kk_sparse_tiles_bind(struct kk_device *dev, struct kk_sparse_tiles *tiles,
+                     uint64_t tile, uint64_t count, struct kk_bo *bo,
+                     uint64_t heap_tile)
+{
+   const uint64_t end = tile + count;
+
+   /* A bind splits at most one range, and adds at most one */
+   struct kk_sparse_range *spare[2] = {kk_sparse_range_alloc(dev),
+                                       kk_sparse_range_alloc(dev)};
+   if (spare[0] == NULL || spare[1] == NULL) {
+      vk_free(&dev->vk.alloc, spare[0]);
+      vk_free(&dev->vk.alloc, spare[1]);
+      return false;
+   }
+
+   struct kk_sparse_range *range = kk_sparse_tiles_find(tiles, tile);
+   while (range != NULL && range->tile < end) {
+      struct kk_sparse_range *next =
+         kk_sparse_range(rb_node_next(&range->node));
+      const uint64_t range_end = range->tile + range->count;
+
+      kk_sparse_unref_memory(dev, range->bo,
+                             MIN2(range_end, end) - MAX2(range->tile, tile));
+
+      if (range->tile < tile && range_end > end) {
+         struct kk_sparse_range *right = spare[0];
+         spare[0] = NULL;
+         *right = (struct kk_sparse_range){
+            .tile = end,
+            .count = range_end - end,
+            .bo = range->bo,
+            .heap_tile = range->heap_tile + (end - range->tile),
+         };
+         range->count = tile - range->tile;
+         rb_tree_insert(&tiles->ranges, &right->node, kk_sparse_range_cmp);
+         break;
+      } else if (range->tile < tile) {
+         range->count = tile - range->tile;
+      } else if (range_end > end) {
+         range->heap_tile += end - range->tile;
+         range->count = range_end - end;
+         range->tile = end;
+      } else {
+         rb_tree_remove(&tiles->ranges, &range->node);
+         vk_free(&dev->vk.alloc, range);
+      }
+
+      range = next;
+   }
+
+   if (bo != NULL) {
+      bo->sparse_refs += count;
+
+      /* Join neighbours that map the tiles next to these in the heap */
+      struct kk_sparse_range *next = kk_sparse_tiles_find(tiles, tile);
+      struct kk_sparse_range *prev = kk_sparse_range(
+         next ? rb_node_prev(&next->node) : rb_tree_last(&tiles->ranges));
+      const bool join_prev = prev != NULL && prev->bo == bo &&
+                             prev->tile + prev->count == tile &&
+                             prev->heap_tile + prev->count == heap_tile;
+      const bool join_next = next != NULL && next->bo == bo &&
+                             next->tile == end &&
+                             heap_tile + count == next->heap_tile;
+
+      if (join_prev && join_next) {
+         prev->count += count + next->count;
+         rb_tree_remove(&tiles->ranges, &next->node);
+         vk_free(&dev->vk.alloc, next);
+      } else if (join_prev) {
+         prev->count += count;
+      } else if (join_next) {
+         next->tile = tile;
+         next->heap_tile = heap_tile;
+         next->count += count;
+      } else {
+         struct kk_sparse_range *added = spare[1];
+         spare[1] = NULL;
+         *added = (struct kk_sparse_range){
+            .tile = tile,
+            .count = count,
+            .bo = bo,
+            .heap_tile = heap_tile,
+         };
+         rb_tree_insert(&tiles->ranges, &added->node, kk_sparse_range_cmp);
+      }
+   }
+
+   vk_free(&dev->vk.alloc, spare[0]);
+   vk_free(&dev->vk.alloc, spare[1]);
+   return true;
+}
+
+/* Mapping updates of one resource from one heap, sent in one call */
+struct kk_bind_batch {
+   struct kk_device *dev;
+   struct kk_queue *queue;
+
+   void *resource;
+   bool texture;
+   mtl_heap *heap;
+   struct util_dynarray ops;
+
+   bool unmapped;
+
+   /* Layers whose tail an opaque bind touched */
+   struct util_dynarray tails;
+};
+
+static void
+kk_bind_batch_flush(struct kk_bind_batch *b)
+{
+   if (b->resource == NULL)
+      return;
+
+   if (b->texture) {
+      mtl_command_queue_update_texture_mappings(
+         b->queue->mtl_handle, b->resource, b->heap,
+         util_dynarray_begin(&b->ops),
+         util_dynarray_num_elements(&b->ops, struct mtl_texture_mapping));
+   } else {
+      mtl_command_queue_update_buffer_mappings(
+         b->queue->mtl_handle, b->resource, b->heap,
+         util_dynarray_begin(&b->ops),
+         util_dynarray_num_elements(&b->ops, struct mtl_buffer_mapping));
+   }
+
+   util_dynarray_clear(&b->ops);
+   b->resource = NULL;
+   b->heap = NULL;
+}
+
+static void
+kk_bind_batch_begin(struct kk_bind_batch *b, void *resource, bool texture,
+                    mtl_heap *heap)
+{
+   if (b->resource == resource && b->heap == heap)
+      return;
+
+   kk_bind_batch_flush(b);
+   b->resource = resource;
+   b->texture = texture;
+   b->heap = heap;
+}
+
+static void
+kk_bind_buffer_tiles(struct kk_bind_batch *b, mtl_buffer *buffer,
+                     mtl_heap *heap, uint64_t tile, uint64_t count,
+                     uint64_t heap_tile)
+{
+   kk_bind_batch_begin(b, buffer, false, heap);
+
+   const bool map = heap != NULL;
+   b->unmapped |= !map;
+
+   if (util_dynarray_num_elements(&b->ops, struct mtl_buffer_mapping) > 0) {
+      struct mtl_buffer_mapping *last =
+         util_dynarray_top_ptr(&b->ops, struct mtl_buffer_mapping);
+      if (last->map == map && last->tile + last->tile_count == tile &&
+          (!map || last->heap_tile + last->tile_count == heap_tile)) {
+         last->tile_count += count;
+         return;
+      }
+   }
+
+   util_dynarray_append(&b->ops, ((struct mtl_buffer_mapping){
+                                    .tile = tile,
+                                    .tile_count = count,
+                                    .heap_tile = map ? heap_tile : 0u,
+                                    .map = map,
+                                 }));
+}
+
+static void
+kk_bind_texture_region(struct kk_bind_batch *b, mtl_texture *texture,
+                       mtl_heap *heap, struct mtl_origin origin,
+                       struct mtl_size size, uint32_t level, uint32_t slice,
+                       uint64_t heap_tile)
+{
+   kk_bind_batch_begin(b, texture, true, heap);
+
+   const bool map = heap != NULL;
+   b->unmapped |= !map;
+
+   /* Rows of tiles extend the previous row */
+   if (util_dynarray_num_elements(&b->ops, struct mtl_texture_mapping) > 0 &&
+       size.y == 1u && size.z == 1u) {
+      struct mtl_texture_mapping *last =
+         util_dynarray_top_ptr(&b->ops, struct mtl_texture_mapping);
+      if (last->map == map && last->level == level && last->slice == slice &&
+          last->size.y == 1u && last->size.z == 1u &&
+          last->origin.y == origin.y && last->origin.z == origin.z &&
+          last->origin.x + last->size.x == origin.x &&
+          (!map || last->heap_tile + last->size.x == heap_tile)) {
+         last->size.x += size.x;
+         return;
+      }
+   }
+
+   util_dynarray_append(&b->ops, ((struct mtl_texture_mapping){
+                                    .origin = origin,
+                                    .size = size,
+                                    .level = level,
+                                    .slice = slice,
+                                    .heap_tile = map ? heap_tile : 0u,
+                                    .map = map,
+                                 }));
+}
+
+/* Later work on the queue starts after the mapping updates */
+static void
+kk_sparse_queue_barrier(struct kk_device *dev, struct kk_queue *queue)
+{
+   struct kk_sparse_device *sparse = &dev->sparse;
+
+   sparse->event_value++;
+   mtl_signal_event(queue->mtl_handle, sparse->event, sparse->event_value);
+   mtl_wait_for_event(queue->mtl_handle, sparse->event, sparse->event_value);
+}
+
+static void
+kk_bind_batch_end(struct kk_bind_batch *b)
+{
+   struct kk_sparse_device *sparse = &b->dev->sparse;
+
+   kk_bind_batch_flush(b);
+
+   /* Work that read through a tile before a lone unmap keeps reading its old
+    * page until the queue maps something. */
+   if (b->unmapped) {
+      kk_bind_buffer_tiles(b, sparse->remap_buffer, sparse->remap_heap, 0u, 1u,
+                           0u);
+      kk_bind_batch_flush(b);
+   }
+
+   util_dynarray_fini(&b->ops);
+   util_dynarray_fini(&b->tails);
+
+   kk_sparse_queue_barrier(b->dev, b->queue);
+
+   /* The unmaps of freed memory are queued, so its heaps can go */
+   kk_sparse_release_memory(b->dev);
+}
+
+/* Tiles [first, first + count) of a level of tiles laid out in X, Y, then Z
+ * order, as boxes Metal walks in the same order.
+ */
+static void
+kk_bind_level_tiles(struct kk_bind_batch *b, mtl_texture *texture,
+                    mtl_heap *heap, struct mtl_size tiles, uint32_t level,
+                    uint32_t slice, uint64_t first, uint64_t count,
+                    uint64_t heap_tile)
+{
+   const uint64_t row = tiles.x;
+   const uint64_t plane = tiles.x * tiles.y;
+   uint64_t i = first;
+   const uint64_t end = first + count;
+
+   while (i < end) {
+      const struct mtl_origin origin = {
+         .x = i % row,
+         .y = (i / row) % tiles.y,
+         .z = i / plane,
+      };
+      struct mtl_size size;
+
+      if (origin.x != 0 || end - i < row) {
+         size = (struct mtl_size){MIN2(row - origin.x, end - i), 1, 1};
+      } else if (origin.y != 0 || end - i < plane) {
+         size = (struct mtl_size){row,
+                                  MIN2(tiles.y - origin.y, (end - i) / row), 1};
+      } else {
+         size = (struct mtl_size){row, tiles.y, (end - i) / plane};
+      }
+
+      kk_bind_texture_region(b, texture, heap, origin, size, level, slice,
+                             heap_tile);
+
+      const uint64_t n = size.x * size.y * size.z;
+      i += n;
+      heap_tile += n;
+   }
+}
+
+/* Maps a layer's tail from the memory its tiles are bound to, tile by tile */
+static void
+kk_bind_image_tail(struct kk_bind_batch *b, struct kk_image *image,
+                   uint32_t layer)
+{
+   struct kk_image_plane *plane = &image->planes[0];
+   struct kk_image_sparse *sparse = &plane->sparse;
+   const uint64_t first =
+      layer * sparse->layer_tiles + sparse->level_tile[sparse->tail_level];
+   const uint64_t end = first + sparse->tail_tiles;
+
+   struct kk_sparse_range *range = kk_sparse_tiles_find(&sparse->tiles, first);
+   uint64_t tile = first;
+   while (tile < end) {
+      /* Unbound up to the next range, then mapped through it */
+      const uint64_t next =
+         range != NULL ? MIN2(MAX2(range->tile, tile), end) : end;
+      if (tile < next) {
+         kk_bind_texture_region(b, plane->mtl_handle, NULL,
+                                (struct mtl_origin){tile - first, 0u, 0u},
+                                (struct mtl_size){next - tile, 1u, 1u},
+                                sparse->tail_level, layer, 0u);
+         tile = next;
+         continue;
+      }
+
+      const uint64_t last = MIN2(range->tile + range->count, end);
+      kk_bind_texture_region(
+         b, plane->mtl_handle, range->bo->mtl_handle,
+         (struct mtl_origin){tile - first, 0u, 0u},
+         (struct mtl_size){last - tile, 1u, 1u}, sparse->tail_level, layer,
+         range->heap_tile + (tile - range->tile));
+      tile = last;
+      range = kk_sparse_range(rb_node_next(&range->node));
+   }
+}
+
+/* Binds a range of a sparse image's opaque memory, in tiles. Tails map once
+ * the image's binds are all recorded. */
+static void
+kk_bind_image_opaque_tiles(struct kk_bind_batch *b, struct kk_image *image,
+                           mtl_heap *heap, uint64_t tile, uint64_t count,
+                           uint64_t heap_tile)
+{
+   const struct kk_image_plane *plane = &image->planes[0];
+   const struct kk_image_sparse *sparse = &plane->sparse;
+   const uint64_t tail_first = sparse->level_tile[sparse->tail_level];
+
+   while (count > 0) {
+      const uint32_t layer = tile / sparse->layer_tiles;
+      const uint64_t in_layer = tile % sparse->layer_tiles;
+
+      uint64_t n;
+      if (in_layer >= tail_first) {
+         n = MIN2(count, sparse->tail_tiles - (in_layer - tail_first));
+         if (util_dynarray_num_elements(&b->tails, uint32_t) == 0 ||
+             *util_dynarray_top_ptr(&b->tails, uint32_t) != layer)
+            util_dynarray_append(&b->tails, layer);
+      } else {
+         uint32_t level = 0;
+         while (sparse->level_tile[level + 1] <= in_layer)
+            level++;
+
+         const uint64_t first = in_layer - sparse->level_tile[level];
+         const uint64_t level_count =
+            sparse->level_tile[level + 1] - sparse->level_tile[level];
+         n = MIN2(count, level_count - first);
+         kk_bind_level_tiles(b, plane->mtl_handle, heap,
+                             kk_image_sparse_level_tiles(plane, level), level,
+                             layer, first, n, heap_tile);
+      }
+
+      tile += n;
+      count -= n;
+      heap_tile += n;
+   }
+}
+
+/* Tiles [*tile, *tile + *count) of a range of bytes of a resource's memory,
+ * or false when the range does not start on a tile or reaches outside the
+ * memory. Only a range that ends with the memory may end inside a tile.
+ */
+static bool
+kk_sparse_bind_range(VkDeviceSize offset_B, VkDeviceSize size_B,
+                     VkDeviceSize resource_B, uint64_t *tile, uint64_t *count)
+{
+   if (offset_B % KK_SPARSE_PAGE_SIZE_B != 0u || offset_B >= resource_B ||
+       size_B > resource_B - offset_B ||
+       (size_B % KK_SPARSE_PAGE_SIZE_B != 0u &&
+        offset_B + size_B != resource_B))
+      return false;
+
+   *tile = offset_B / KK_SPARSE_PAGE_SIZE_B;
+   *count = DIV_ROUND_UP(size_B, KK_SPARSE_PAGE_SIZE_B);
+   return true;
+}
+
+/* Memory and first heap tile for a bind of count tiles, or NULL memory to
+ * unbind. Memory whose heap cannot back tiles, as imported memory, binds as
+ * unbound. False when the tiles do not start on a tile of the memory or reach
+ * past its end.
+ */
+static bool
+kk_sparse_bind_memory(VkDeviceMemory memory, VkDeviceSize offset_B,
+                      uint64_t count, struct kk_bo **bo_out,
+                      uint64_t *heap_tile_out)
+{
+   VK_FROM_HANDLE(kk_device_memory, mem, memory);
+
+   *bo_out = NULL;
+   *heap_tile_out = 0u;
+   if (mem == NULL)
+      return true;
+
+   const uint64_t heap_tiles = mem->bo->sparse_tiles;
+   if (heap_tiles == 0u) {
+      vk_loge(VK_LOG_OBJS(&mem->vk.base),
+              "Memory that cannot back sparse tiles is bound as unbound");
+      return true;
+   }
+
+   const uint64_t heap_tile = offset_B / KK_SPARSE_PAGE_SIZE_B;
+   if (offset_B % KK_SPARSE_PAGE_SIZE_B != 0u || heap_tile > heap_tiles ||
+       count > heap_tiles - heap_tile)
+      return false;
+
+   *bo_out = mem->bo;
+   *heap_tile_out = heap_tile;
+   return true;
+}
+
+static mtl_heap *
+kk_bo_heap(struct kk_bo *bo)
+{
+   return bo ? bo->mtl_handle : NULL;
+}
+
+static VkResult
+kk_bind_sparse_buffer(struct kk_bind_batch *b,
+                      const VkSparseBufferMemoryBindInfo *info)
+{
+   VK_FROM_HANDLE(kk_buffer, buffer, info->buffer);
+   VkResult result = VK_SUCCESS;
+
+   for (uint32_t i = 0; i < info->bindCount; i++) {
+      const VkSparseMemoryBind *bind = &info->pBinds[i];
+      if (bind->size == 0)
+         continue;
+
+      uint64_t tile, count, heap_tile;
+      struct kk_bo *bo;
+      /* The buffer's memory is whole tiles */
+      if (!kk_sparse_bind_range(bind->resourceOffset, bind->size,
+                                align64(buffer->vk.size, KK_SPARSE_PAGE_SIZE_B),
+                                &tile, &count) ||
+          !kk_sparse_bind_memory(bind->memory, bind->memoryOffset, count, &bo,
+                                 &heap_tile)) {
+         vk_loge(VK_LOG_OBJS(&buffer->vk.base),
+                 "Sparse bind outside the buffer or its memory is dropped");
+         continue;
+      }
+
+      if (!kk_sparse_tiles_bind(b->dev, &buffer->sparse.tiles, tile, count,
+                                bo, heap_tile)) {
+         result = vk_error(b->dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         continue;
+      }
+
+      kk_bind_buffer_tiles(b, buffer->metal.handle, kk_bo_heap(bo), tile,
+                           count, heap_tile);
+   }
+
+   return result;
+}
+
+static VkResult
+kk_bind_sparse_image_opaque(struct kk_bind_batch *b,
+                            const VkSparseImageOpaqueMemoryBindInfo *info)
+{
+   VK_FROM_HANDLE(kk_image, image, info->image);
+   struct kk_image_plane *plane = &image->planes[0];
+   VkResult result = VK_SUCCESS;
+
+   for (uint32_t i = 0; i < info->bindCount; i++) {
+      const VkSparseMemoryBind *bind = &info->pBinds[i];
+
+      /* No sparse image has a metadata aspect */
+      if (bind->size == 0 || (bind->flags & VK_SPARSE_MEMORY_BIND_METADATA_BIT))
+         continue;
+
+      uint64_t tile, count, heap_tile;
+      struct kk_bo *bo;
+      if (!kk_sparse_bind_range(bind->resourceOffset, bind->size,
+                                plane->layout.size_B, &tile, &count) ||
+          !kk_sparse_bind_memory(bind->memory, bind->memoryOffset, count, &bo,
+                                 &heap_tile)) {
+         vk_loge(VK_LOG_OBJS(&image->vk.base),
+                 "Sparse bind outside the image or its memory is dropped");
+         continue;
+      }
+
+      if (!kk_sparse_tiles_bind(b->dev, &plane->sparse.tiles, tile, count, bo,
+                                heap_tile)) {
+         result = vk_error(b->dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+         continue;
+      }
+
+      kk_bind_image_opaque_tiles(b, image, kk_bo_heap(bo), tile, count,
+                                 heap_tile);
+   }
+
+   util_dynarray_foreach(&b->tails, uint32_t, layer)
+      kk_bind_image_tail(b, image, *layer);
+   util_dynarray_clear(&b->tails);
+
+   return result;
+}
+
+VkResult
+kk_queue_bind_sparse(struct kk_queue *queue, struct vk_queue_submit *submit)
+{
+   struct kk_device *dev = kk_queue_device(queue);
+   struct kk_sparse_device *sparse = &dev->sparse;
+   VkResult result = VK_SUCCESS;
+
+   if (!sparse->enabled)
+      return VK_SUCCESS;
+
+   struct kk_bind_batch b = {
+      .dev = dev,
+      .queue = queue,
+      .ops = UTIL_DYNARRAY_INIT,
+      .tails = UTIL_DYNARRAY_INIT,
+   };
+
+   simple_mtx_lock(&sparse->lock);
+
+   for (uint32_t i = 0; i < submit->buffer_bind_count; i++) {
+      VkResult r = kk_bind_sparse_buffer(&b, &submit->buffer_binds[i]);
+      if (result == VK_SUCCESS)
+         result = r;
+   }
+
+   for (uint32_t i = 0; i < submit->image_opaque_bind_count; i++) {
+      VkResult r =
+         kk_bind_sparse_image_opaque(&b, &submit->image_opaque_binds[i]);
+      if (result == VK_SUCCESS)
+         result = r;
+   }
+
+   kk_bind_batch_end(&b);
+
+   simple_mtx_unlock(&sparse->lock);
+
+   return result;
+}

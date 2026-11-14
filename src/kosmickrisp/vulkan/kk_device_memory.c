@@ -142,8 +142,10 @@ kk_AllocateMemory(VkDevice device, const VkMemoryAllocateInfo *pAllocateInfo,
       mem->bo->gpu = mtl_buffer_get_gpu_address(mem->bo->map);
       mem->bo->cpu = mtl_get_contents(mem->bo->map);
    } else {
-      result =
-         kk_alloc_bo(dev, &dev->vk.base, aligned_size, alignment, &mem->bo);
+      const enum kk_bo_flags flags =
+         dev->vk.enabled_features.sparseBinding ? KK_BO_SPARSE_TILES : 0u;
+      result = kk_alloc_bo_flags(dev, &dev->vk.base, aligned_size, alignment,
+                                 flags, &mem->bo);
       if (result != VK_SUCCESS)
          goto fail_alloc;
    }
@@ -171,7 +173,9 @@ kk_FreeMemory(VkDevice device, VkDeviceMemory _mem,
    if (mem->map)
       kk_bo_unmap(dev, mem->bo, mem->map, false);
 
-   kk_destroy_bo(dev, mem->bo);
+   /* Tiles still mapped from the heap keep it until they unmap */
+   if (!kk_sparse_keep_memory(dev, mem->bo))
+      kk_destroy_bo(dev, mem->bo);
 
    vk_device_memory_destroy(&dev->vk, pAllocator, &mem->vk);
 }

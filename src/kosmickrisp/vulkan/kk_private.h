@@ -40,6 +40,10 @@
 
 #define KK_SPARSE_ADDR_SPACE_SIZE (1ull << 39)
 
+/* Page size of placement sparse resources. Only 64 KB pages give Vulkan's
+ * standard sparse block shapes. */
+#define KK_SPARSE_PAGE_SIZE_B (64u * 1024u)
+
 /* Max size of a bound cbuf */
 #define KK_MAX_CBUF_SIZE (1u << 16)
 

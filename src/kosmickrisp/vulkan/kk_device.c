@@ -306,11 +306,15 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    if (dev->residency_set.handle == NULL)
       goto fail_compiler;
 
+   result = kk_device_init_sparse(dev);
+   if (result != VK_SUCCESS)
+      goto fail_vab_memory;
+
    if (pCreateInfo->queueCreateInfoCount > 0) {
       result =
          kk_queue_init(dev, &dev->queue, &pCreateInfo->pQueueCreateInfos[0], 0);
       if (result != VK_SUCCESS)
-         goto fail_vab_memory;
+         goto fail_sparse;
       dev->has_queue = true;
    }
 
@@ -351,6 +355,8 @@ fail_mem_cache:
       kk_queue_finish(dev, &dev->queue);
       dev->has_queue = false;
    }
+fail_sparse:
+   kk_device_finish_sparse(dev);
 fail_vab_memory:
    mtl_release(dev->residency_set.handle);
    simple_mtx_destroy(&dev->residency_set.mutex);
@@ -391,6 +397,8 @@ kk_DestroyDevice(VkDevice _device, const VkAllocationCallbacks *pAllocator)
       kk_queue_finish(dev, &dev->queue);
       dev->has_queue = false;
    }
+
+   kk_device_finish_sparse(dev);
 
    /* Release the residency set last once all BOs are released. */
    mtl_release(dev->residency_set.handle);
@@ -454,6 +462,24 @@ kk_device_remove_buffer_from_residency_set(struct kk_device *dev,
 {
    simple_mtx_lock(&dev->residency_set.mutex);
    mtl_residency_set_remove_allocation(dev->residency_set.handle, buffer);
+   simple_mtx_unlock(&dev->residency_set.mutex);
+}
+
+void
+kk_device_add_texture_to_residency_set(struct kk_device *dev,
+                                       mtl_texture *texture)
+{
+   simple_mtx_lock(&dev->residency_set.mutex);
+   mtl_residency_set_add_allocation(dev->residency_set.handle, texture);
+   simple_mtx_unlock(&dev->residency_set.mutex);
+}
+
+void
+kk_device_remove_texture_from_residency_set(struct kk_device *dev,
+                                            mtl_texture *texture)
+{
+   simple_mtx_lock(&dev->residency_set.mutex);
+   mtl_residency_set_remove_allocation(dev->residency_set.handle, texture);
    simple_mtx_unlock(&dev->residency_set.mutex);
 }
 

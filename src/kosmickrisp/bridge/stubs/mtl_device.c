@@ -101,6 +101,12 @@ mtl_device_supports_32_bit_float_filtering(mtl_device *dev)
    return false;
 }
 
+bool
+mtl_device_supports_placement_sparse(mtl_device *dev)
+{
+   return false;
+}
+
 /* Timestamp query */
 uint64_t
 mtl_device_get_gpu_timestamp(mtl_device *dev)
@@ -168,7 +174,28 @@ mtl_sparse_tile_count(mtl_device *device, struct kk_image_layout *layout,
    return (struct mtl_size){};
 }
 
+struct mtl_size
+mtl_placement_sparse_tile_size(mtl_device *device, enum mtl_texture_type type,
+                               enum mtl_pixel_format format,
+                               uint32_t sample_count)
+{
+   return (struct mtl_size){};
+}
+
 /* Resource creation */
+mtl_buffer *
+mtl_new_placement_sparse_buffer(mtl_device *device, uint64_t size_B)
+{
+   return NULL;
+}
+
+mtl_texture *
+mtl_new_placement_sparse_texture(mtl_device *device,
+                                 const struct kk_image_layout *layout)
+{
+   return NULL;
+}
+
 mtl_buffer *
 mtl_new_buffer_with_bytes_no_copy(mtl_device *device, void *ptr,
                                   uint64_t size_B)

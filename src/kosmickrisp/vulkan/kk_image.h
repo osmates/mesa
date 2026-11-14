@@ -12,6 +12,7 @@
 
 #include "kk_device_memory.h"
 #include "kk_image_layout.h"
+#include "kk_sparse.h"
 
 #include "kosmickrisp/bridge/mtl_types.h"
 
@@ -29,8 +30,29 @@ kk_get_image_format_features(struct kk_physical_device *pdevice,
 uint32_t kk_image_max_dimension(const struct kk_physical_device *pdev,
                                 VkImageType image_type);
 
+/* A sparse image's memory, as vkQueueBindSparse sees it: each layer holds its
+ * levels before the tail, tile by tile in X, Y, then Z order, and then its
+ * tail. Metal walks a mapped region in the same order.
+ */
+struct kk_image_sparse {
+   /* Tile size in pixels */
+   struct mtl_size tile_px;
+
+   /* First level in the tail, or the level count without a tail */
+   uint32_t tail_level;
+   uint32_t tail_tiles;
+
+   /* First tile of each level within a layer, up to the tail's */
+   uint64_t level_tile[KK_MAX_MIP_LEVELS + 1];
+   uint64_t layer_tiles;
+
+   /* What each tile of the image's memory maps from */
+   struct kk_sparse_tiles tiles;
+};
+
 struct kk_image_plane {
    struct kk_image_layout layout;
+   struct kk_image_sparse sparse;
    struct kk_device_memory *mem;
    uint64_t mem_offset_B;
    // TODO_KOSMICKRISP Only have one handle since we will only create 2D arrays
@@ -75,6 +97,23 @@ kk_image_to_mtl_resource(const struct kk_image *image, int plane)
 }
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_image, vk.base, VkImage, VK_OBJECT_TYPE_IMAGE)
+
+static inline bool
+kk_image_is_sparse(const struct kk_image *image)
+{
+   return image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT;
+}
+
+static inline struct mtl_size
+kk_image_sparse_level_tiles(const struct kk_image_plane *plane, uint32_t level)
+{
+   const struct mtl_size tile = plane->sparse.tile_px;
+   return (struct mtl_size){
+      .x = DIV_ROUND_UP(u_minify(plane->layout.width_px, level), tile.x),
+      .y = DIV_ROUND_UP(u_minify(plane->layout.height_px, level), tile.y),
+      .z = DIV_ROUND_UP(u_minify(plane->layout.depth_px, level), tile.z),
+   };
+}
 
 static inline uint64_t
 kk_image_plane_base_address(const struct kk_image_plane *plane)

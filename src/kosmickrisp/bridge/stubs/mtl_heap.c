@@ -9,7 +9,7 @@
 /* Creation */
 mtl_heap *
 mtl_new_heap(mtl_device *device, uint64_t size,
-             enum mtl_resource_options resource_options)
+             enum mtl_resource_options resource_options, bool sparse_tiles)
 {
    return NULL;
 }

@@ -19,8 +19,9 @@
 #endif /* DETECT_OS_APPLE */
 
 VkResult
-kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
-            uint64_t size_B, uint64_t align_B, struct kk_bo **bo_out)
+kk_alloc_bo_flags(struct kk_device *dev, struct vk_object_base *log_obj,
+                  uint64_t size_B, uint64_t align_B, enum kk_bo_flags flags,
+                  struct kk_bo **bo_out)
 {
    VkResult result = VK_SUCCESS;
 
@@ -39,8 +40,13 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
 #endif
 
    size_B = align64(size_B, minimum_alignment);
-   mtl_heap *handle =
-      mtl_new_heap(dev->mtl_handle, size_B, KK_MTL_RESOURCE_OPTIONS);
+
+   /* A heap that backs sparse tiles rounds up to whole tiles, so only memory
+    * large enough for a tile gets it. */
+   const bool sparse_tiles =
+      (flags & KK_BO_SPARSE_TILES) && size_B >= KK_SPARSE_PAGE_SIZE_B;
+   mtl_heap *handle = mtl_new_heap(dev->mtl_handle, size_B,
+                                   KK_MTL_RESOURCE_OPTIONS, sparse_tiles);
    if (handle == NULL) {
       result = vk_errorf(log_obj, VK_ERROR_OUT_OF_DEVICE_MEMORY, "%m");
       goto fail_heap;
@@ -64,6 +70,8 @@ kk_alloc_bo(struct kk_device *dev, struct vk_object_base *log_obj,
    bo->map = map;
    bo->gpu = mtl_buffer_get_gpu_address(map);
    bo->cpu = mtl_get_contents(map);
+   bo->sparse_tiles =
+      sparse_tiles ? mtl_heap_get_size(handle) / KK_SPARSE_PAGE_SIZE_B : 0u;
 
    kk_device_add_heap_to_residency_set(dev, handle);
 

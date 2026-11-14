@@ -32,6 +32,15 @@ mtl_texture_first_mipmap_in_tail(mtl_texture *texture)
    }
 }
 
+uint64_t
+mtl_texture_tail_size_in_bytes(mtl_texture *texture)
+{
+   @autoreleasepool {
+      id<MTLTexture> tex = (id<MTLTexture>)texture;
+      return [tex tailSizeInBytes];
+   }
+}
+
 /* TODO_KOSMICKRISP This should be part of the mapping */
 static uint32_t
 mtl_texture_view_type(uint32_t type, uint8_t sample_count)

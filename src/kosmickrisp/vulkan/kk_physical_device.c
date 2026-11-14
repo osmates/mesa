@@ -248,6 +248,7 @@ kk_get_device_features(
       .robustBufferAccess = true,
       .samplerAnisotropy = true,
       .sampleRateShading = true,
+      .sparseBinding = info->supports_placement_sparse,
       .shaderClipDistance = true,
       .shaderCullDistance = true,
       .shaderImageGatherExtended = true,
@@ -1069,6 +1070,8 @@ get_metal_limits(struct kk_physical_device *pdev)
       mtl_device_supports_bc_texture_compression(pdev->mtl_dev_handle);
    pdev->info.supports_32_bit_float_filtering =
       mtl_device_supports_32_bit_float_filtering(pdev->mtl_dev_handle);
+   pdev->info.supports_placement_sparse =
+      mtl_device_supports_placement_sparse(pdev->mtl_dev_handle);
    pdev->info.gpu_apple_family =
       mtl_device_get_gpu_apple_family(pdev->mtl_dev_handle);
 
@@ -1228,9 +1231,13 @@ kk_enumerate_physical_devices(struct vk_instance *_instance)
    assert(pdev->mem_heap_count <= ARRAY_SIZE(pdev->mem_heaps));
    assert(pdev->mem_type_count <= ARRAY_SIZE(pdev->mem_types));
 
+   VkQueueFlags queue_flags =
+      VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+   if (supported_features.sparseBinding)
+      queue_flags |= VK_QUEUE_SPARSE_BINDING_BIT;
+
    pdev->queue_families[pdev->queue_family_count++] = (struct kk_queue_family){
-      .queue_flags =
-         VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT,
+      .queue_flags = queue_flags,
       .queue_count = 1,
    };
    assert(pdev->queue_family_count <= ARRAY_SIZE(pdev->queue_families));

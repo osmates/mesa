@@ -108,6 +108,8 @@ kk_files = files(
   'kk_sampler.c',
   'kk_shader.h',
   'kk_shader.c',
+  'kk_sparse.h',
+  'kk_sparse.c',
   'kk_sync.h',
   'kk_sync.c',
   'kk_wsi.h',

@@ -19,6 +19,12 @@ mtl_texture_first_mipmap_in_tail(mtl_texture *texture)
    return 0u;
 }
 
+uint64_t
+mtl_texture_tail_size_in_bytes(mtl_texture *texture)
+{
+   return 0u;
+}
+
 /* Texture view creation */
 mtl_texture *
 mtl_new_texture_view_with(mtl_texture *texture,

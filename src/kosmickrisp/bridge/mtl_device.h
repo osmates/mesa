@@ -38,6 +38,7 @@ uint64_t mtl_device_current_allocated_size(mtl_device *dev);
 uint32_t mtl_device_max_argument_buffer_sampler_count(mtl_device *dev);
 bool mtl_device_supports_bc_texture_compression(mtl_device *dev);
 bool mtl_device_supports_32_bit_float_filtering(mtl_device *dev);
+bool mtl_device_supports_placement_sparse(mtl_device *dev);
 
 /* Timestamp query */
 uint64_t mtl_device_get_gpu_timestamp(mtl_device *dev);
@@ -67,9 +68,20 @@ struct mtl_size mtl_sparse_tile_count(mtl_device *device,
                                       struct kk_image_layout *layout,
                                       struct mtl_size tile_size);
 
+/* Placement sparse resources use 64 KB pages, KK_SPARSE_PAGE_SIZE_B */
+struct mtl_size mtl_placement_sparse_tile_size(mtl_device *device,
+                                               enum mtl_texture_type type,
+                                               enum mtl_pixel_format format,
+                                               uint32_t sample_count);
+
 /* Resource creation */
 mtl_buffer *mtl_new_buffer_with_bytes_no_copy(mtl_device *device, void *ptr,
                                               uint64_t size_B);
+mtl_buffer *mtl_new_placement_sparse_buffer(mtl_device *device,
+                                            uint64_t size_B);
+mtl_texture *
+mtl_new_placement_sparse_texture(mtl_device *device,
+                                 const struct kk_image_layout *layout);
 mtl_command_allocator *mtl_new_command_allocator(mtl_device *device);
 mtl_command_buffer *mtl_new_command_buffer(mtl_device *device);
 

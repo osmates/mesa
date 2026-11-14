@@ -10,13 +10,17 @@
 #include "mtl_types.h"
 
 #include <inttypes.h>
+#include <stdbool.h>
 
 /* TODO_KOSMICKRISP We should move this struct to the bridge side. */
 struct kk_image_layout;
 
-/* Creation */
+/* Creation. A heap made for sparse tiles can back the tiles of placement
+ * sparse resources, and its size rounds up to a whole tile.
+ */
 mtl_heap *mtl_new_heap(mtl_device *device, uint64_t size,
-                       enum mtl_resource_options resource_options);
+                       enum mtl_resource_options resource_options,
+                       bool sparse_tiles);
 
 /* Utils */
 uint64_t mtl_heap_get_size(mtl_heap *heap);
