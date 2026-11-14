@@ -54,17 +54,6 @@ struct virtgpu_bo {
 
 // #define INDEPENDENT_RENDER_CONTEXT
 
-/* WDDM2.9+ */
-#define HW_CONTEXT
-
-#if defined(HW_CONTEXT) && !defined(VIRTUAL_CONTEXT_SUPPORT)
-#error "Cannot support hw physical contexts"
-#endif
-
-#if defined(HW_CONTEXT) && defined(INDEPENDENT_RENDER_CONTEXT)
-#error "No need to support independent hw contexts"
-#endif
-
 struct virtgpu_sync {
    struct vn_renderer_sync base;
    D3DKMT_HANDLE handle; /* Monitored fence */
@@ -158,13 +147,15 @@ struct virtgpu_exec_context_base {
 
 #ifdef VIRTUAL_CONTEXT_SUPPORT
 
-#ifdef HW_CONTEXT
-#define VIRTIO_WDDM_TIMELINE_COUNT 64
-#define VIRTIO_WDDM_NODE           1
-#else
-#define VIRTIO_WDDM_TIMELINE_COUNT 61
-#define VIRTIO_WDDM_NODE           3
-#endif
+/* A driver with hardware queues takes every ring on one context with a
+ * hardware queue on node 1.  Without them, each ring gets a context of its
+ * own on nodes 3 onwards, since dxgkrnl runs at most two submissions of a
+ * context at a time.
+ */
+#define VIRTIO_WDDM_HW_QUEUE_TIMELINE_COUNT 64
+#define VIRTIO_WDDM_HW_QUEUE_NODE           1
+#define VIRTIO_WDDM_RING_TIMELINE_COUNT     61
+#define VIRTIO_WDDM_RING_NODE               3
 #define MAX_COMMAND_SIZE           (4096 - 32)
 struct virtgpu_exec_context_virtual {
    struct virtgpu_exec_context_base base;
@@ -206,13 +197,15 @@ struct virtgpu {
 
    struct virtgpu_sync *submission_fence;
    uint64_t pending_submission_value;
-#ifndef INDEPENDENT_RENDER_CONTEXT
-#if defined(VIRTUAL_CONTEXT_SUPPORT) && !defined(HW_CONTEXT)
-   struct virtgpu_exec_context_virtual ctx[VIRTIO_WDDM_TIMELINE_COUNT];
-#elif defined(HW_CONTEXT)
+#ifdef VIRTUAL_CONTEXT_SUPPORT
+   bool use_hw_queue;
    mtx_t hwq_submit_lock;
-   struct virtgpu_exec_context_virtual ctx;
+   struct virtgpu_exec_context_virtual hw_ctx;
    struct virtgpu_hw_queue hw_queue;
+#endif
+#ifndef INDEPENDENT_RENDER_CONTEXT
+#if defined(VIRTUAL_CONTEXT_SUPPORT)
+   struct virtgpu_exec_context_virtual ctx[VIRTIO_WDDM_RING_TIMELINE_COUNT];
 #else
    mtx_t ctx_lock;
    struct virtgpu_exec_context ctx[64];
@@ -258,6 +251,16 @@ struct virtgpu {
    // bool supports_cross_device;
 };
 
+static inline bool
+virtgpu_uses_hw_queue(const struct virtgpu *gpu)
+{
+#ifdef VIRTUAL_CONTEXT_SUPPORT
+   return gpu->use_hw_queue;
+#else
+   return false;
+#endif
+}
+
 static inline NTSTATUS
 hr_to_nt(struct virtgpu *gpu, HRESULT hr)
 {
@@ -285,16 +288,15 @@ hr_to_nt(struct virtgpu *gpu, HRESULT hr)
 static NTSTATUS
 virtgpu_ioctl_create_context_virtual(struct virtgpu *gpu,
                                      unsigned node,
+                                     bool hw_queue,
                                      struct virtgpu_exec_context_virtual *ctx)
 {
    if (gpu->ddicb != NULL) {
       D3DDDICB_CREATECONTEXTVIRTUAL context = {
          .NodeOrdinal = node,
-#ifdef HW_CONTEXT
          .Flags = {
-            .HwQueueSupported = 1,
+            .HwQueueSupported = hw_queue,
          },
-#endif
       };
       NTSTATUS status =
          hr_to_nt(gpu, gpu->ddicb->pKTCallbacks->pfnCreateContextVirtualCb(
@@ -311,11 +313,9 @@ virtgpu_ioctl_create_context_virtual(struct virtgpu *gpu,
          .hDevice = gpu->d3dkmt.device,
          .NodeOrdinal = node,
          .ClientHint = D3DKMT_CLIENTHINT_VULKAN,
-#ifdef HW_CONTEXT
          .Flags = {
-            .HwQueueSupported = 1,
+            .HwQueueSupported = hw_queue,
          },
-#endif
       };
 
       NTSTATUS status = gpu->d3dkmt.cb.create_context_virtual(&context);
@@ -383,7 +383,7 @@ virtgpu_ioctl_create_context(struct virtgpu *gpu,
 }
 #endif
 
-#ifdef HW_CONTEXT
+#ifdef VIRTUAL_CONTEXT_SUPPORT
 static NTSTATUS
 virtgpu_ioctl_create_hw_queue(struct virtgpu *gpu,
                               struct virtgpu_exec_context_virtual *ctx,
@@ -617,7 +617,7 @@ virtgpu_ioctl_wait_for_synchronization_objects_from_gpu(
    }
 }
 
-#ifdef HW_CONTEXT
+#ifdef VIRTUAL_CONTEXT_SUPPORT
 static NTSTATUS
 virtgpu_ioctl_submit_signal_synchronization_objects_to_hw_queue(
    struct virtgpu *gpu,
@@ -700,8 +700,9 @@ virtgpu_ioctl_signal_synchronization_object_from_cpu(struct virtgpu *gpu,
       if (allow_rewind) {
          /* This is stupid, but there doesn't seem to be another way */
          struct virtgpu_exec_context_virtual context = {};
-         NTSTATUS status =
-            virtgpu_ioctl_create_context_virtual(gpu, 1, &context);
+         NTSTATUS status = virtgpu_ioctl_create_context_virtual(
+            gpu, VIRTIO_WDDM_HW_QUEUE_NODE, virtgpu_uses_hw_queue(gpu),
+            &context);
          if (!NT_SUCCESS(status)) {
             vn_log(gpu->instance, "could create sync context: 0x%lx", status);
             return status;
@@ -1151,7 +1152,7 @@ virtgpu_ioctl_render(struct virtgpu *gpu,
 }
 #endif
 
-#ifdef HW_CONTEXT
+#ifdef VIRTUAL_CONTEXT_SUPPORT
 static NTSTATUS
 virtgpu_ioctl_submit_to_hw_queue(struct virtgpu *gpu,
                                  struct virtgpu_hw_queue *hw_queue,
@@ -1712,6 +1713,43 @@ virtgpu_init_shmem_blob_mem(ASSERTED struct virtgpu *gpu)
    gpu->shmem_blob_mem = VIRTIO_WDDM_BLOB_MEM_HOST3D;
 }
 
+#if defined(VIRTUAL_CONTEXT_SUPPORT) && !defined(INDEPENDENT_RENDER_CONTEXT)
+/* A driver without hardware queues refuses the context or the queue, and
+ * each ring then gets a context of its own.
+ */
+static bool
+virtgpu_init_hw_queue(struct virtgpu *gpu)
+{
+   NTSTATUS status = virtgpu_ioctl_create_context_virtual(
+      gpu, VIRTIO_WDDM_HW_QUEUE_NODE, true, &gpu->hw_ctx);
+   if (!NT_SUCCESS(status)) {
+      if (VN_DEBUG(INIT)) {
+         vn_log(gpu->instance, "no hw context (0x%lx), using one per ring",
+                status);
+      }
+      memset(&gpu->hw_ctx, 0, sizeof(gpu->hw_ctx));
+      return false;
+   }
+
+   status = virtgpu_ioctl_create_hw_queue(gpu, &gpu->hw_ctx, &gpu->hw_queue);
+   if (!NT_SUCCESS(status)) {
+      if (VN_DEBUG(INIT)) {
+         vn_log(gpu->instance,
+                "no hw queue (0x%lx), using one context per ring", status);
+      }
+      virtgpu_ioctl_destroy_context(gpu, &gpu->hw_ctx.base);
+      memset(&gpu->hw_ctx, 0, sizeof(gpu->hw_ctx));
+      memset(&gpu->hw_queue, 0, sizeof(gpu->hw_queue));
+      return false;
+   }
+
+   if (VN_DEBUG(INIT))
+      vn_log(gpu->instance, "created hw queue: 0x%x", gpu->hw_queue.kmt);
+
+   return true;
+}
+#endif
+
 static VkResult
 virtgpu_init_context(struct virtgpu *gpu)
 {
@@ -1755,38 +1793,23 @@ virtgpu_init_context(struct virtgpu *gpu)
    }
 
 #ifndef INDEPENDENT_RENDER_CONTEXT
-#if defined(VIRTUAL_CONTEXT_SUPPORT) && !defined(HW_CONTEXT)
-   for (size_t i = 0; i < ARRAY_SIZE(gpu->ctx); i++) {
-      status = virtgpu_ioctl_create_context_virtual(gpu, VIRTIO_WDDM_NODE + i,
-                                                    &gpu->ctx[i]);
-      if (!NT_SUCCESS(status)) {
-         if (VN_DEBUG(INIT)) {
-            vn_log(gpu->instance, "failed to create virtual context: 0x%lx",
-                   status);
+#if defined(VIRTUAL_CONTEXT_SUPPORT)
+   gpu->use_hw_queue = virtgpu_init_hw_queue(gpu);
+   if (gpu->use_hw_queue) {
+      gpu->max_timeline_count = VIRTIO_WDDM_HW_QUEUE_TIMELINE_COUNT;
+   } else {
+      gpu->max_timeline_count = VIRTIO_WDDM_RING_TIMELINE_COUNT;
+      for (size_t i = 0; i < ARRAY_SIZE(gpu->ctx); i++) {
+         status = virtgpu_ioctl_create_context_virtual(
+            gpu, VIRTIO_WDDM_RING_NODE + i, false, &gpu->ctx[i]);
+         if (!NT_SUCCESS(status)) {
+            if (VN_DEBUG(INIT)) {
+               vn_log(gpu->instance,
+                      "failed to create virtual context: 0x%lx", status);
+            }
+            return VK_ERROR_INITIALIZATION_FAILED;
          }
-         return VK_ERROR_INITIALIZATION_FAILED;
       }
-      // mtx_init(&gpu->ctx[i].lock, mtx_plain);
-   }
-#elif defined(HW_CONTEXT)
-   status =
-      virtgpu_ioctl_create_context_virtual(gpu, VIRTIO_WDDM_NODE, &gpu->ctx);
-   if (!NT_SUCCESS(status)) {
-      if (VN_DEBUG(INIT)) {
-         vn_log(gpu->instance, "failed to create hw context: 0x%lx", status);
-      }
-      return VK_ERROR_INITIALIZATION_FAILED;
-   }
-   status =
-      virtgpu_ioctl_create_hw_queue(gpu, &gpu->ctx, &gpu->hw_queue);
-   if (!NT_SUCCESS(status)) {
-      if (VN_DEBUG(INIT)) {
-         vn_log(gpu->instance, "failed to create hw queue: 0x%lx", status);
-      }
-      return VK_ERROR_INITIALIZATION_FAILED;
-   }
-   if (VN_DEBUG(INIT)) {
-      vn_log(gpu->instance, "created hw queue: 0x%x", gpu->hw_queue.kmt);
    }
 #else
    for (size_t i = 0; i < ARRAY_SIZE(gpu->ctx); i++) {
@@ -1881,7 +1904,11 @@ virtgpu_init_params(struct virtgpu *gpu)
    /* Don't care about cross-device */
    // gpu->supports_cross_device = false;
 
+#if defined(VIRTUAL_CONTEXT_SUPPORT) && defined(INDEPENDENT_RENDER_CONTEXT)
+   gpu->max_timeline_count = VIRTIO_WDDM_RING_TIMELINE_COUNT;
+#elif !defined(VIRTUAL_CONTEXT_SUPPORT)
    gpu->max_timeline_count = VIRTIO_WDDM_TIMELINE_COUNT;
+#endif
 
    status = virtgpu_ioctl_pci_address(
       gpu, &gpu->pci_bus_info.domain, &gpu->pci_bus_info.bus,
@@ -2903,11 +2930,11 @@ end:
    return res;
 }
 
+/* With a hardware queue, ctx is NULL and the batch goes to hw_queue. */
 static VkResult
 virtgpu_submit_batch(struct virtgpu *gpu,
-#if defined(VIRTUAL_CONTEXT_SUPPORT) && !defined(HW_CONTEXT)
+#ifdef VIRTUAL_CONTEXT_SUPPORT
                      struct virtgpu_exec_context_virtual *ctx,
-#elif defined(HW_CONTEXT)
                      struct virtgpu_hw_queue *hw_queue,
 #else
                      struct virtgpu_exec_context *ctx,
@@ -2918,6 +2945,9 @@ virtgpu_submit_batch(struct virtgpu *gpu,
 {
    VkResult ret = VK_SUCCESS;
    NTSTATUS status = STATUS_SUCCESS;
+#ifndef VIRTUAL_CONTEXT_SUPPORT
+   const void *hw_queue = NULL;
+#endif
 
    STACK_ARRAY(D3DKMT_HANDLE, sync_objects, batch->sync_count);
    if (!sync_objects)
@@ -2930,14 +2960,19 @@ virtgpu_submit_batch(struct virtgpu *gpu,
    }
 
    if (syncobj_wait && batch->sync_count > 0) {
-#ifdef HW_CONTEXT
-      status = virtgpu_ioctl_submit_wait_for_synchronization_objects_to_hw_queue(
-         gpu, hw_queue, sync_objects, batch->sync_values, batch->sync_count);
-#else
-      status = virtgpu_ioctl_wait_for_synchronization_objects_from_gpu(
-         gpu, &ctx->base, sync_objects, batch->sync_values,
-         batch->sync_count);
+#ifdef VIRTUAL_CONTEXT_SUPPORT
+      if (hw_queue) {
+         status =
+            virtgpu_ioctl_submit_wait_for_synchronization_objects_to_hw_queue(
+               gpu, hw_queue, sync_objects, batch->sync_values,
+               batch->sync_count);
+      } else
 #endif
+      {
+         status = virtgpu_ioctl_wait_for_synchronization_objects_from_gpu(
+            gpu, &ctx->base, sync_objects, batch->sync_values,
+            batch->sync_count);
+      }
       if (!NT_SUCCESS(status)) {
          vn_log(gpu->instance, "failed to wait: 0x%lx", status);
          ret = VK_ERROR_DEVICE_LOST;
@@ -2945,9 +2980,12 @@ virtgpu_submit_batch(struct virtgpu *gpu,
       }
    }
 
-#ifndef HW_CONTEXT
-   uint64_t next_submission_value, current_submission_value;
-   if (!escape) {
+   /* Contexts of their own may run in any order: keep the order of the
+    * submissions with a fence they wait on and signal in turn.
+    */
+   const bool ordered = !hw_queue && !escape;
+   uint64_t next_submission_value = 0, current_submission_value;
+   if (ordered) {
       next_submission_value = p_atomic_inc_return(&gpu->pending_submission_value);
       current_submission_value = next_submission_value - 1;
 
@@ -2960,14 +2998,42 @@ virtgpu_submit_batch(struct virtgpu *gpu,
          goto end;
       }
    }
-#endif
 
-#if defined(VIRTUAL_CONTEXT_SUPPORT) && !defined(HW_CONTEXT)
+#ifdef VIRTUAL_CONTEXT_SUPPORT
    assert(batch->cs_size <= MAX_COMMAND_SIZE);
    // FIXME: empty command is somehow valid?
    // assert(batch->cs_size > 0);
 
-   if (escape) {
+   if (hw_queue) {
+      /* dxgkrnl will ignore zero-sized submissions and break KMD assumptions */
+      if (batch->cs_size > 0) {
+         /* Submit via SubmitCommandToHwQueue */
+         struct {
+            VIRTIO_WDDM_SubmitCommand submit;
+            VIRTIO_WDDM_CommandHeader hdr;
+            uint8_t command[MAX_COMMAND_SIZE];
+         } submit_priv;
+
+         submit_priv.submit.tag = VIRTIO_WDDM_SUBMIT_COMMAND_VIRTUAL_TAG;
+         submit_priv.hdr.id = VIRTIO_WDDM_COMMAND_ID_SUBMIT;
+         submit_priv.hdr.flags = VIRTIO_WDDM_COMMAND_FLAG_RING_IDX;
+         submit_priv.hdr.ring = batch->ring_idx;
+         submit_priv.hdr.size = batch->cs_size;
+
+         memcpy(submit_priv.command, batch->cs_data, batch->cs_size);
+
+         const size_t submit_priv_size = sizeof(submit_priv.submit) +
+                                         sizeof(submit_priv.hdr) +
+                                         batch->cs_size;
+         status = virtgpu_ioctl_submit_to_hw_queue(
+            gpu, hw_queue, 0, batch->cs_size, &submit_priv, submit_priv_size);
+         if (!NT_SUCCESS(status)) {
+            vn_log(gpu->instance, "failed to submit command: 0x%lx", status);
+            ret = VK_ERROR_DEVICE_LOST;
+            goto end;
+         }
+      }
+   } else if (escape) {
       /* Submit via vendor Escape */
       struct {
          VIRTIO_WDDM_ExecBuffer exec_buf;
@@ -3043,38 +3109,6 @@ virtgpu_submit_batch(struct virtgpu *gpu,
          goto end;
       }
    }
-#elif defined(HW_CONTEXT)
-   assert(batch->cs_size <= MAX_COMMAND_SIZE);
-
-   /* dxgkrnl will ignore zero-sized submissions and break KMD assumptions */
-   if (batch->cs_size > 0) {
-      /* Submit via SubmitCommandToHwQueue */
-      struct {
-         VIRTIO_WDDM_SubmitCommand submit;
-         VIRTIO_WDDM_CommandHeader hdr;
-         uint8_t command[MAX_COMMAND_SIZE];
-      } submit_priv;
-
-      submit_priv.submit.tag = VIRTIO_WDDM_SUBMIT_COMMAND_VIRTUAL_TAG;
-      submit_priv.hdr.id = VIRTIO_WDDM_COMMAND_ID_SUBMIT;
-      submit_priv.hdr.flags = VIRTIO_WDDM_COMMAND_FLAG_RING_IDX;
-      submit_priv.hdr.ring = batch->ring_idx;
-      submit_priv.hdr.size = batch->cs_size;
-
-      memcpy(submit_priv.command, batch->cs_data, batch->cs_size);
-
-      const size_t submit_priv_size =
-         sizeof(submit_priv.submit) + sizeof(submit_priv.hdr) + batch->cs_size;
-      status =
-         virtgpu_ioctl_submit_to_hw_queue(gpu, hw_queue, 0,
-                                          batch->cs_size, &submit_priv,
-                                          submit_priv_size);
-      if (!NT_SUCCESS(status)) {
-         vn_log(gpu->instance, "failed to submit command: 0x%lx", status);
-         ret = VK_ERROR_DEVICE_LOST;
-         goto end;
-      }
-   }
 #else
    VIRTIO_WDDM_CommandHeader *hdr = ctx->cmd_buf;
    hdr->id = VIRTIO_WDDM_COMMAND_ID_SUBMIT;
@@ -3093,8 +3127,7 @@ virtgpu_submit_batch(struct virtgpu *gpu,
       goto end;
    }
 #endif
-#ifndef HW_CONTEXT
-   if (!escape) {
+   if (ordered) {
       status = virtgpu_ioctl_signal_synchronization_objects_from_gpu(gpu,
          &ctx->base, &gpu->submission_fence->handle, &next_submission_value, 1,
          /* rewind */ false, /* signal at submission */ true);
@@ -3104,21 +3137,26 @@ virtgpu_submit_batch(struct virtgpu *gpu,
          goto end;
       }
    }
-#endif
 
    if (!syncobj_wait && batch->sync_count > 0) {
       // TODO: handle more syncs
       assert(batch->sync_count <= 32);
 
-#ifdef HW_CONTEXT
-      status = virtgpu_ioctl_submit_signal_synchronization_objects_to_hw_queue(
-         gpu, hw_queue, sync_objects, batch->sync_values, batch->sync_count,
-         /* rewind */ false, /* signal at submission */ false);
-#else
-      status = virtgpu_ioctl_signal_synchronization_objects_from_gpu(
-         gpu, &ctx->base, sync_objects, batch->sync_values, batch->sync_count,
-         /* rewind */ false, /* signal at submission */ false);
+#ifdef VIRTUAL_CONTEXT_SUPPORT
+      if (hw_queue) {
+         status =
+            virtgpu_ioctl_submit_signal_synchronization_objects_to_hw_queue(
+               gpu, hw_queue, sync_objects, batch->sync_values,
+               batch->sync_count, /* rewind */ false,
+               /* signal at submission */ false);
+      } else
 #endif
+      {
+         status = virtgpu_ioctl_signal_synchronization_objects_from_gpu(
+            gpu, &ctx->base, sync_objects, batch->sync_values,
+            batch->sync_count, /* rewind */ false,
+            /* signal at submission */ false);
+      }
       if (!NT_SUCCESS(status)) {
          vn_log(gpu->instance, "failed to signal: 0x%lx", status);
          ret = VK_ERROR_DEVICE_LOST;
@@ -3141,7 +3179,7 @@ virtgpu_submit(struct vn_renderer *renderer,
 #if defined(VIRTUAL_CONTEXT_SUPPORT) && defined(INDEPENDENT_RENDER_CONTEXT)
    struct virtgpu_exec_context_virtual ctx = {};
    NTSTATUS status = virtgpu_ioctl_create_context_virtual(
-      gpu, VIRTIO_WDDM_NODE + batch->ring_idx, &ctx);
+      gpu, VIRTIO_WDDM_RING_NODE + batch->ring_idx, false, &ctx);
    if (!NT_SUCCESS(status)) {
       vn_log(gpu->instance, "failed to create independent context: 0x%lx",
              status);
@@ -3149,8 +3187,8 @@ virtgpu_submit(struct vn_renderer *renderer,
       goto end;
    }
 
-   ret = virtgpu_submit_batch(gpu, &ctx, batch, !VN_PERF(NO_ASYNC_QUEUE_SUBMIT),
-                              false);
+   ret = virtgpu_submit_batch(gpu, &ctx, NULL, batch,
+                              !VN_PERF(NO_ASYNC_QUEUE_SUBMIT), false);
 
    status = virtgpu_ioctl_destroy_context(gpu, &ctx.base);
    if (!NT_SUCCESS(status)) {
@@ -3158,15 +3196,16 @@ virtgpu_submit(struct vn_renderer *renderer,
       ret = VK_ERROR_DEVICE_LOST;
       goto end;
    }
-#elif defined(HW_CONTEXT)
-   ret = virtgpu_submit_batch(gpu, &gpu->hw_queue, batch, false, false);
+end:
 #elif defined(VIRTUAL_CONTEXT_SUPPORT)
-   struct virtgpu_exec_context_virtual *ctx = &gpu->ctx[batch->ring_idx];
-   // struct virtgpu_exec_context_virtual *ctx = &gpu->ctx[0];
-   // mtx_lock(&ctx->lock);
-   ret = virtgpu_submit_batch(gpu, ctx, batch, !VN_PERF(NO_ASYNC_QUEUE_SUBMIT),
-                              false);
-   // mtx_unlock(&ctx->lock);
+   if (gpu->use_hw_queue) {
+      ret =
+         virtgpu_submit_batch(gpu, NULL, &gpu->hw_queue, batch, false, false);
+   } else {
+      assert(batch->ring_idx < ARRAY_SIZE(gpu->ctx));
+      ret = virtgpu_submit_batch(gpu, &gpu->ctx[batch->ring_idx], NULL, batch,
+                                 !VN_PERF(NO_ASYNC_QUEUE_SUBMIT), false);
+   }
 #elif defined(INDEPENDENT_RENDER_CONTEXT)
    struct virtgpu_exec_context ctx = {};
    NTSTATUS status = virtgpu_ioctl_create_context(gpu, &ctx);
@@ -3225,7 +3264,7 @@ virtgpu_submit_wait(struct vn_renderer *renderer,
 #if defined(VIRTUAL_CONTEXT_SUPPORT) && defined(INDEPENDENT_RENDER_CONTEXT)
    struct virtgpu_exec_context_virtual ctx = {};
    NTSTATUS status = virtgpu_ioctl_create_context_virtual(
-      gpu, VIRTIO_WDDM_NODE + batch->ring_idx, &ctx);
+      gpu, VIRTIO_WDDM_RING_NODE + batch->ring_idx, false, &ctx);
    if (!NT_SUCCESS(status)) {
       vn_log(gpu->instance, "failed to create independent context: 0x%lx",
              status);
@@ -3233,7 +3272,7 @@ virtgpu_submit_wait(struct vn_renderer *renderer,
       goto end;
    }
 
-   ret = virtgpu_submit_batch(gpu, &ctx, batch, false, true);
+   ret = virtgpu_submit_batch(gpu, &ctx, NULL, batch, false, true);
 
    status = virtgpu_ioctl_destroy_context(gpu, &ctx.base);
    if (!NT_SUCCESS(status)) {
@@ -3242,14 +3281,15 @@ virtgpu_submit_wait(struct vn_renderer *renderer,
       goto end;
    }
 end:
-#elif defined(HW_CONTEXT)
-   ret = virtgpu_submit_batch(gpu, &gpu->hw_queue, batch, false, true);
 #elif defined(VIRTUAL_CONTEXT_SUPPORT)
-   struct virtgpu_exec_context_virtual *ctx = &gpu->ctx[batch->ring_idx];
-   // struct virtgpu_exec_context_virtual *ctx = &gpu->ctx[0];
-   // mtx_lock(&ctx->lock);
-   ret = virtgpu_submit_batch(gpu, ctx, batch, false, true);
-   // mtx_unlock(&ctx->lock);
+   if (gpu->use_hw_queue) {
+      ret =
+         virtgpu_submit_batch(gpu, NULL, &gpu->hw_queue, batch, false, true);
+   } else {
+      assert(batch->ring_idx < ARRAY_SIZE(gpu->ctx));
+      ret = virtgpu_submit_batch(gpu, &gpu->ctx[batch->ring_idx], NULL, batch,
+                                 false, true);
+   }
 #elif defined(INDEPENDENT_RENDER_CONTEXT)
    struct virtgpu_exec_context ctx = {};
    NTSTATUS status = virtgpu_ioctl_create_context(gpu, &ctx);
@@ -3359,18 +3399,15 @@ virtgpu_destroy(struct vn_renderer *renderer,
    vn_renderer_shmem_cache_fini(&gpu->shmem_cache);
 
 #ifndef INDEPENDENT_RENDER_CONTEXT
-#if defined(VIRTUAL_CONTEXT_SUPPORT) && !defined(HW_CONTEXT)
+#if defined(VIRTUAL_CONTEXT_SUPPORT)
    for (size_t i = 0; i < ARRAY_SIZE(gpu->ctx); i++) {
       if (gpu->ctx[i].base.h)
          virtgpu_ioctl_destroy_context(gpu, &gpu->ctx[i].base);
-      // mtx_destroy(&gpu->ctx[i].lock);
    }
-#elif defined(HW_CONTEXT)
-   if (gpu->ctx.base.h)
-      virtgpu_ioctl_destroy_context(gpu, &gpu->ctx.base);
    if (gpu->hw_queue.h)
       virtgpu_ioctl_destroy_hw_queue(gpu, &gpu->hw_queue);
-   mtx_destroy(&gpu->hwq_submit_lock);
+   if (gpu->hw_ctx.base.h)
+      virtgpu_ioctl_destroy_context(gpu, &gpu->hw_ctx.base);
 #else
    for (size_t i = 0; i < ARRAY_SIZE(gpu->ctx); i++) {
       if (gpu->ctx[i].base.h)
@@ -3386,6 +3423,9 @@ virtgpu_destroy(struct vn_renderer *renderer,
       FreeLibrary(gpu->d3dkmt.lib);
 
    mtx_destroy(&gpu->win32_handle_import_mutex);
+#ifdef VIRTUAL_CONTEXT_SUPPORT
+   mtx_destroy(&gpu->hwq_submit_lock);
+#endif
 #ifndef VIRTUAL_CONTEXT_SUPPORT
 #ifndef INDEPENDENT_RENDER_CONTEXT
    mtx_destroy(&gpu->ctx_lock);
@@ -3412,7 +3452,7 @@ virtgpu_init(struct virtgpu *gpu, void *info)
 
 #if !defined(VIRTUAL_CONTEXT_SUPPORT) && !defined(INDEPENDENT_RENDER_CONTEXT)
    mtx_init(&gpu->ctx_lock, mtx_plain);
-#elif defined(HW_CONTEXT)
+#elif defined(VIRTUAL_CONTEXT_SUPPORT)
    mtx_init(&gpu->hwq_submit_lock, mtx_plain);
 #endif
 
