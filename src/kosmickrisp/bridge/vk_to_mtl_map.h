@@ -20,6 +20,7 @@ enum mtl_sampler_reduction_mode;
 enum mtl_compare_function;
 enum mtl_winding;
 enum mtl_cull_mode;
+enum mtl_triangle_fill_mode;
 enum mtl_index_type;
 enum mtl_command_queue_error;
 enum mtl_depth_resolve_filter;
@@ -39,6 +40,7 @@ enum VkSamplerReductionMode;
 enum VkCompareOp;
 enum VkFrontFace;
 enum VkCullModeFlagBits;
+enum VkPolygonMode;
 enum VkResolveModeFlagBits;
 
 /* STRUCTS */
@@ -83,6 +85,9 @@ vk_compare_op_to_mtl_compare_function(enum VkCompareOp op);
 enum mtl_winding vk_front_face_to_mtl_winding(enum VkFrontFace face);
 
 enum mtl_cull_mode vk_front_face_to_mtl_cull_mode(enum VkCullModeFlagBits mode);
+
+enum mtl_triangle_fill_mode
+vk_polygon_mode_to_mtl_triangle_fill_mode(enum VkPolygonMode mode);
 
 enum mtl_depth_resolve_filter
 vk_resolve_mode_to_mtl_depth_resolve_filter(

@@ -913,12 +913,17 @@ kk_flush_sample_locations(struct kk_cmd_buffer *cmd)
       }
    }
 
-   /* Determine if we have switched to or from multisampled bresenham lines */
-   if (IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) || IS_DIRTY(RS_LINE_MODE)) {
+   /* Determine if we have switched to or from multisampled bresenham lines.
+    * Triangles in line polygon mode rasterize as lines. */
+   if (IS_DIRTY(IA_PRIMITIVE_TOPOLOGY) || IS_DIRTY(RS_LINE_MODE) ||
+       IS_DIRTY(RS_POLYGON_MODE)) {
       bool was_ms_bresenham_lines = render->ms_bresenham_lines;
+      enum mesa_prim prim =
+         u_reduced_prim(vk_topology_to_mesa(dyn->ia.primitive_topology));
       render->ms_bresenham_lines =
-         u_reduced_prim(vk_topology_to_mesa(dyn->ia.primitive_topology)) ==
-            MESA_PRIM_LINES &&
+         (prim == MESA_PRIM_LINES ||
+          (prim == MESA_PRIM_TRIANGLES &&
+           dyn->rs.polygon_mode == VK_POLYGON_MODE_LINE)) &&
          dyn->rs.line.mode == VK_LINE_RASTERIZATION_MODE_BRESENHAM &&
          render->samples > 1;
 
@@ -1448,6 +1453,12 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
          /* Enforce setting the correct scissors */
          BITSET_SET(dyn->dirty, MESA_VK_DYNAMIC_VP_VIEWPORT_COUNT);
       }
+   }
+
+   /* Metal's fill mode applies to triangles alone, as Vulkan's polygon mode */
+   if (IS_DIRTY(RS_POLYGON_MODE)) {
+      mtl_set_triangle_fill_mode(
+         enc, vk_polygon_mode_to_mtl_triangle_fill_mode(dyn->rs.polygon_mode));
    }
 
    /* We enable raster discard by setting scissor to size (0, 0) */

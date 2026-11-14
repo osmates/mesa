@@ -256,6 +256,19 @@ vk_front_face_to_mtl_cull_mode(enum VkCullModeFlagBits mode)
    }
 }
 
+enum mtl_triangle_fill_mode
+vk_polygon_mode_to_mtl_triangle_fill_mode(enum VkPolygonMode mode)
+{
+   switch (mode) {
+   case VK_POLYGON_MODE_FILL:
+      return MTL_TRIANGLE_FILL_MODE_FILL;
+   case VK_POLYGON_MODE_LINE:
+      return MTL_TRIANGLE_FILL_MODE_LINES;
+   default:
+      UNREACHABLE("Unsupported VkPolygonMode");
+   }
+}
+
 enum mtl_depth_resolve_filter
 vk_resolve_mode_to_mtl_depth_resolve_filter(
    enum VkResolveModeFlagBits resolve_mode)
