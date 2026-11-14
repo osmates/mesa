@@ -1327,23 +1327,22 @@ virtgpu_ioctl_get_caps(struct virtgpu *gpu,
                        void *capset,
                        size_t capset_size)
 {
-   struct {
-      VIRTIO_WDDM_Capset capset;
-      uint8_t caps[capset_size];
-   } caps = {};
+   const size_t size = sizeof(VIRTIO_WDDM_Capset) + capset_size;
+   VIRTIO_WDDM_Capset *caps = calloc(1, size);
+   if (!caps)
+      return STATUS_NO_MEMORY;
 
-   caps.capset = (VIRTIO_WDDM_Capset){
+   *caps = (VIRTIO_WDDM_Capset){
       .tag = VIRTIO_WDDM_ESCAPE_CAPSET_TAG,
       .capset_id = id,
       .version = version,
    };
 
-   NTSTATUS status = virtgpu_ioctl_escape(gpu, NULL, &caps, sizeof(caps));
-   if (!NT_SUCCESS(status)) {
-      return status;
-   }
-   memcpy(capset, caps.caps, capset_size);
+   NTSTATUS status = virtgpu_ioctl_escape(gpu, NULL, caps, size);
+   if (NT_SUCCESS(status))
+      memcpy(capset, caps->capset, capset_size);
 
+   free(caps);
    return status;
 }
 
@@ -1468,7 +1467,7 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
    struct {
       VIRTIO_WDDM_CreateResource resource;
       VIRTIO_WDDM_CommandHeader hdr;
-      uint8_t body[batch ? batch->cs_size : 0];
+      uint8_t body[MAX_COMMAND_SIZE];
    } res_priv;
    res_priv.resource.tag = VIRTIO_WDDM_CREATE_RESOURCE_TAG;
 
@@ -1479,9 +1478,11 @@ virtgpu_ioctl_resource_create_blob(struct virtgpu *gpu,
       assert(batch->sync_count == 0);
       /* Kernel does not yet support buffers bigger than
        * PAGE_SIZE - sizeof(struct virtio_gpu_cmd_submit) */
-      assert(batch->cs_size <= (4096 - 32));
+      if (batch->cs_size > MAX_COMMAND_SIZE)
+         return STATUS_INVALID_PARAMETER;
 
-      res_priv_size = sizeof(res_priv);
+      res_priv_size =
+         sizeof(res_priv.resource) + sizeof(res_priv.hdr) + batch->cs_size;
 
       res_priv.hdr.id = VIRTIO_WDDM_COMMAND_ID_SUBMIT;
       res_priv.hdr.flags = VIRTIO_WDDM_COMMAND_FLAG_RING_IDX;
@@ -3339,7 +3340,9 @@ virtgpu_init_renderer_info(struct virtgpu *gpu)
       info->needs_implicit_queue_sync = false;
       info->id.has_luid = true;
       info->id.node_mask = 1; /* TODO D3D12 interop*/
-      static_assert(sizeof(gpu->d3dkmt.luid) == VK_LUID_SIZE);
+      static_assert(
+         sizeof(gpu->d3dkmt.luid) == VK_LUID_SIZE,
+         "LUID and VkPhysicalDeviceIDProperties::deviceLUID differ");
       memcpy(info->id.luid, &gpu->d3dkmt.luid, VK_LUID_SIZE);
    }
 }
