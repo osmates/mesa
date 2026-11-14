@@ -666,6 +666,96 @@ kk_bind_sparse_image_opaque(struct kk_bind_batch *b,
    return result;
 }
 
+static VkResult
+kk_bind_sparse_image(struct kk_bind_batch *b,
+                     const VkSparseImageMemoryBindInfo *info)
+{
+   VK_FROM_HANDLE(kk_image, image, info->image);
+   struct kk_image_plane *plane = &image->planes[0];
+   struct kk_image_sparse *sparse = &plane->sparse;
+   const struct mtl_size tile_px = sparse->tile_px;
+   VkResult result = VK_SUCCESS;
+
+   for (uint32_t i = 0; i < info->bindCount; i++) {
+      const VkSparseImageMemoryBind *bind = &info->pBinds[i];
+      const uint32_t level = bind->subresource.mipLevel;
+      const uint32_t layer = bind->subresource.arrayLayer;
+
+      /* Offsets are whole tiles inside the subresource, which is before the
+       * tail, as the tail binds through opaque binds only. Extents are whole
+       * tiles or reach the level's edge. */
+      if (level >= sparse->tail_level || layer >= plane->layout.layers ||
+          bind->offset.x < 0 || bind->offset.y < 0 || bind->offset.z < 0 ||
+          bind->offset.x % tile_px.x != 0 || bind->offset.y % tile_px.y != 0 ||
+          bind->offset.z % tile_px.z != 0) {
+         vk_loge(VK_LOG_OBJS(&image->vk.base),
+                 "Sparse bind outside the image's tiles is dropped");
+         continue;
+      }
+
+      const struct mtl_size level_tiles =
+         kk_image_sparse_level_tiles(plane, level);
+      const struct mtl_origin origin = {
+         .x = bind->offset.x / tile_px.x,
+         .y = bind->offset.y / tile_px.y,
+         .z = bind->offset.z / tile_px.z,
+      };
+      if (origin.x >= level_tiles.x || origin.y >= level_tiles.y ||
+          origin.z >= level_tiles.z)
+         continue;
+
+      const struct mtl_size size = {
+         .x = MIN2(DIV_ROUND_UP(bind->extent.width, tile_px.x),
+                   level_tiles.x - origin.x),
+         .y = MIN2(DIV_ROUND_UP(bind->extent.height, tile_px.y),
+                   level_tiles.y - origin.y),
+         .z = MIN2(DIV_ROUND_UP(bind->extent.depth, tile_px.z),
+                   level_tiles.z - origin.z),
+      };
+      if (size.x == 0 || size.y == 0 || size.z == 0)
+         continue;
+
+      uint64_t heap_tile;
+      struct kk_bo *bo;
+      if (!kk_sparse_bind_memory(bind->memory, bind->memoryOffset,
+                                 size.x * size.y * size.z, &bo, &heap_tile)) {
+         vk_loge(VK_LOG_OBJS(&image->vk.base),
+                 "Sparse bind outside its memory is dropped");
+         continue;
+      }
+
+      /* Row by row, so what is recorded is what is mapped */
+      const uint64_t level_first =
+         layer * sparse->layer_tiles + sparse->level_tile[level];
+      for (uint32_t z = 0; z < size.z; z++) {
+         for (uint32_t y = 0; y < size.y; y++) {
+            const struct mtl_origin row = {
+               origin.x,
+               origin.y + y,
+               origin.z + z,
+            };
+            const uint64_t tile =
+               level_first +
+               (row.z * level_tiles.y + row.y) * level_tiles.x + row.x;
+            const uint64_t row_heap_tile =
+               heap_tile + ((uint64_t)z * size.y + y) * size.x;
+
+            if (!kk_sparse_tiles_bind(b->dev, &sparse->tiles, tile, size.x,
+                                      bo, row_heap_tile)) {
+               result = vk_error(b->dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+               continue;
+            }
+
+            kk_bind_texture_region(b, plane->mtl_handle, kk_bo_heap(bo), row,
+                                   (struct mtl_size){size.x, 1u, 1u}, level,
+                                   layer, row_heap_tile);
+         }
+      }
+   }
+
+   return result;
+}
+
 VkResult
 kk_queue_bind_sparse(struct kk_queue *queue, struct vk_queue_submit *submit)
 {
@@ -694,6 +784,12 @@ kk_queue_bind_sparse(struct kk_queue *queue, struct vk_queue_submit *submit)
    for (uint32_t i = 0; i < submit->image_opaque_bind_count; i++) {
       VkResult r =
          kk_bind_sparse_image_opaque(&b, &submit->image_opaque_binds[i]);
+      if (result == VK_SUCCESS)
+         result = r;
+   }
+
+   for (uint32_t i = 0; i < submit->image_bind_count; i++) {
+      VkResult r = kk_bind_sparse_image(&b, &submit->image_binds[i]);
       if (result == VK_SUCCESS)
          result = r;
    }

@@ -153,6 +153,9 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
        * having to create a texture for every possible subresource up-front */
       if (util_format_is_compressed(plane->layout.format.pipe) &&
           !util_format_is_compressed(view_layout.format.pipe)) {
+         /* Sparse images have no heap offsets to alias */
+         assert(!kk_image_is_sparse(image));
+
          uint64_t subres_offset_B =
             kk_get_layer_level_B(&plane->layout, view_layout.base_array_layer,
                                  view_layout.base_level);

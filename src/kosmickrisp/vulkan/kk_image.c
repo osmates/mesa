@@ -260,9 +260,59 @@ kk_image_max_dimension(const struct kk_physical_device *pdev,
    }
 }
 
+/* Vulkan's standard 2D sparse block shape for single sample images, in
+ * pixels */
+static struct mtl_size
+kk_standard_sparse_block_px(enum pipe_format format)
+{
+   struct mtl_size block_el;
+   switch (util_format_get_blocksize(format)) {
+   case 1:
+      block_el = (struct mtl_size){256u, 256u, 1u};
+      break;
+   case 2:
+      block_el = (struct mtl_size){256u, 128u, 1u};
+      break;
+   case 4:
+      block_el = (struct mtl_size){128u, 128u, 1u};
+      break;
+   case 8:
+      block_el = (struct mtl_size){128u, 64u, 1u};
+      break;
+   case 16:
+      block_el = (struct mtl_size){64u, 64u, 1u};
+      break;
+   default:
+      return (struct mtl_size){0u, 0u, 0u};
+   }
+
+   block_el.x *= util_format_get_blockwidth(format);
+   block_el.y *= util_format_get_blockheight(format);
+   return block_el;
+}
+
 #define KK_IMAGE_CREATE_SPARSE_FLAGS                                           \
    (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |                                       \
     VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT | VK_IMAGE_CREATE_SPARSE_ALIASED_BIT)
+
+/* Metal misplaces levels of placement sparse textures in the BC, ETC2 and EAC
+ * formats when a level above them is not a whole number of blocks: blits and
+ * samples of 51 x 65, 1028 x 1028 or 1920 x 1080 images lose blocks or whole
+ * levels, while ASTC and uncompressed formats keep them.
+ */
+static bool
+kk_sparse_residency_format_supported(enum pipe_format format)
+{
+   switch (util_format_description(format)->layout) {
+   case UTIL_FORMAT_LAYOUT_S3TC:
+   case UTIL_FORMAT_LAYOUT_RGTC:
+   case UTIL_FORMAT_LAYOUT_BPTC:
+   case UTIL_FORMAT_LAYOUT_ETC:
+      return false;
+   default:
+      return true;
+   }
+}
 
 /* Sparse images are single sample 2D colour or depth-only images with optimal
  * tiling, backed by placement sparse textures.
@@ -310,7 +360,20 @@ kk_image_supports_sparse(struct kk_physical_device *pdev,
    const struct mtl_size tile =
       mtl_placement_sparse_tile_size(pdev->mtl_dev_handle, MTL_TEXTURE_TYPE_2D,
                                      va_format->mtl_pixel_format, 1u);
-   return tile.x != 0 && tile.y != 0 && tile.z != 0;
+   if (tile.x == 0 || tile.y == 0 || tile.z == 0)
+      return false;
+
+   /* Sparse residency promises the standard block shape */
+   if (info->flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) {
+      if (!kk_sparse_residency_format_supported(p_format))
+         return false;
+
+      const struct mtl_size standard = kk_standard_sparse_block_px(p_format);
+      if (tile.x != standard.x || tile.y != standard.y || tile.z != standard.z)
+         return false;
+   }
+
+   return true;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -623,8 +686,40 @@ kk_GetPhysicalDeviceSparseImageFormatProperties2(
    const VkPhysicalDeviceSparseImageFormatInfo2 *pFormatInfo,
    uint32_t *pPropertyCount, VkSparseImageFormatProperties2 *pProperties)
 {
-   *pPropertyCount = 0;
-   return;
+   VK_FROM_HANDLE(kk_physical_device, pdev, physicalDevice);
+   VK_OUTARRAY_MAKE_TYPED(VkSparseImageFormatProperties2, out, pProperties,
+                          pPropertyCount);
+
+   const VkPhysicalDeviceImageFormatInfo2 image_info = {
+      .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+      .format = pFormatInfo->format,
+      .type = pFormatInfo->type,
+      .tiling = pFormatInfo->tiling,
+      .usage = pFormatInfo->usage,
+      .flags = VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+               VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT,
+   };
+   VkImageFormatProperties2 image_props = {
+      .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+   };
+   if (kk_GetPhysicalDeviceImageFormatProperties2(physicalDevice, &image_info,
+                                                  &image_props) != VK_SUCCESS ||
+       !(pFormatInfo->samples & image_props.imageFormatProperties.sampleCounts))
+      return;
+
+   const struct kk_va_format *va_format =
+      kk_get_va_format(vk_format_to_pipe_format(pFormatInfo->format));
+   const struct mtl_size tile =
+      mtl_placement_sparse_tile_size(pdev->mtl_dev_handle, MTL_TEXTURE_TYPE_2D,
+                                     va_format->mtl_pixel_format, 1u);
+
+   vk_outarray_append_typed(VkSparseImageFormatProperties2, &out, p)
+   {
+      p->properties = (VkSparseImageFormatProperties){
+         .aspectMask = vk_format_aspects(pFormatInfo->format),
+         .imageGranularity = {tile.x, tile.y, tile.z},
+      };
+   }
 }
 
 /* A sparse image's texture exists from the start, without memory. Its tiles
@@ -916,13 +1011,49 @@ kk_GetDeviceImageMemoryRequirements(VkDevice device,
    kk_image_finish(dev, &image, NULL);
 }
 
+/* Each layer has a tail of its own, after the layer's other tiles */
+static void
+kk_get_image_sparse_memory_requirements(
+   const struct kk_image *image, uint32_t *pSparseMemoryRequirementCount,
+   VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
+{
+   VK_OUTARRAY_MAKE_TYPED(VkSparseImageMemoryRequirements2, out,
+                          pSparseMemoryRequirements,
+                          pSparseMemoryRequirementCount);
+
+   if (!(image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT))
+      return;
+
+   const struct kk_image_sparse *sparse = &image->planes[0].sparse;
+   vk_outarray_append_typed(VkSparseImageMemoryRequirements2, &out, r)
+   {
+      r->memoryRequirements = (VkSparseImageMemoryRequirements){
+         .formatProperties =
+            {
+               .aspectMask = image->vk.aspects,
+               .imageGranularity = {sparse->tile_px.x, sparse->tile_px.y,
+                                    sparse->tile_px.z},
+            },
+         .imageMipTailFirstLod = sparse->tail_level,
+         .imageMipTailSize =
+            (uint64_t)sparse->tail_tiles * KK_SPARSE_PAGE_SIZE_B,
+         .imageMipTailOffset =
+            sparse->level_tile[sparse->tail_level] * KK_SPARSE_PAGE_SIZE_B,
+         .imageMipTailStride = sparse->layer_tiles * KK_SPARSE_PAGE_SIZE_B,
+      };
+   }
+}
+
 VKAPI_ATTR void VKAPI_CALL
 kk_GetImageSparseMemoryRequirements2(
    VkDevice device, const VkImageSparseMemoryRequirementsInfo2 *pInfo,
    uint32_t *pSparseMemoryRequirementCount,
    VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
 {
-   *pSparseMemoryRequirementCount = 0u;
+   VK_FROM_HANDLE(kk_image, image, pInfo->image);
+
+   kk_get_image_sparse_memory_requirements(image, pSparseMemoryRequirementCount,
+                                           pSparseMemoryRequirements);
 }
 
 VKAPI_ATTR void VKAPI_CALL
@@ -931,7 +1062,18 @@ kk_GetDeviceImageSparseMemoryRequirements(
    uint32_t *pSparseMemoryRequirementCount,
    VkSparseImageMemoryRequirements2 *pSparseMemoryRequirements)
 {
-   *pSparseMemoryRequirementCount = 0u;
+   VK_FROM_HANDLE(kk_device, dev, device);
+   struct kk_image image = {0};
+
+   VkResult result = kk_image_init(dev, &image, pInfo->pCreateInfo);
+   if (result == VK_SUCCESS) {
+      kk_get_image_sparse_memory_requirements(
+         &image, pSparseMemoryRequirementCount, pSparseMemoryRequirements);
+   } else {
+      *pSparseMemoryRequirementCount = 0u;
+   }
+
+   kk_image_finish(dev, &image, NULL);
 }
 
 static void

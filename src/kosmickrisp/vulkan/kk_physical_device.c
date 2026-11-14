@@ -249,6 +249,9 @@ kk_get_device_features(
       .samplerAnisotropy = true,
       .sampleRateShading = true,
       .sparseBinding = info->supports_placement_sparse,
+      .sparseResidencyAliased = info->supports_placement_sparse,
+      .sparseResidencyBuffer = info->supports_placement_sparse,
+      .sparseResidencyImage2D = info->supports_placement_sparse,
       .shaderClipDistance = true,
       .shaderCullDistance = true,
       .shaderImageGatherExtended = true,
@@ -675,10 +678,14 @@ kk_get_device_properties(
       .optimalBufferCopyRowPitchAlignment = 1,
       .nonCoherentAtomSize = 64,
 
-      /* Vulkan 1.0 sparse properties */
+      /* Vulkan 1.0 sparse properties. Unbound tiles read as zero and drop
+       * writes, but a dropped write stays in the GPU's caches until the next
+       * barrier, so the invocation that wrote it reads it back. Images whose
+       * 64 KB tiles are not the standard shape get no sparse residency. */
       .sparseResidencyNonResidentStrict = false,
       .sparseResidencyAlignedMipSize = false,
-      .sparseResidencyStandard2DBlockShape = false,
+      .sparseResidencyStandard2DBlockShape =
+         pdev->info.supports_placement_sparse,
       .sparseResidencyStandard2DMultisampleBlockShape = false,
       .sparseResidencyStandard3DBlockShape = false,
 
