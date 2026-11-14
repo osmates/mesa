@@ -272,6 +272,8 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_aa_line_width:
    case nir_intrinsic_load_xfb_address:
    case nir_intrinsic_load_rasterization_stream:
+   case nir_intrinsic_load_rasterizer_state_poly:
+   case nir_intrinsic_load_depth_bias_poly:
    case nir_intrinsic_load_num_vertices:
    case nir_intrinsic_load_fb_layers_v3d:
    case nir_intrinsic_load_fep_w_v3d:
@@ -882,6 +884,7 @@ visit_intrinsic(nir_intrinsic_instr *instr, struct divergence_state *state)
    case nir_intrinsic_load_depth_texture_kk:
    case nir_intrinsic_load_sampler_handle_kk:
    case nir_intrinsic_load_viewport_z_range_kk:
+   case nir_intrinsic_load_viewport_transform_poly:
    case nir_intrinsic_load_texture_scale:
    case nir_intrinsic_load_inline_data_intel:
    case nir_intrinsic_load_push_data_intel:

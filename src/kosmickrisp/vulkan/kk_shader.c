@@ -1169,7 +1169,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
 
       nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
       NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
-               &shader->info.gs);
+               &shader->info.gs, NULL);
 
       /* Keep these for XFB. KK doesn't expose pipeline statistics. */
       if (shader->info.gs.xfb) {
@@ -1883,7 +1883,7 @@ kk_compile_gs_adjacency(struct kk_physical_device *pdev, nir_shader *nir,
 
    struct poly_gs_info info;
    nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
-   NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs, &info);
+   NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs, &info, NULL);
    ralloc_free(count);
    ralloc_free(pre_gs);
 

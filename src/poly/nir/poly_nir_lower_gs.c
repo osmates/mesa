@@ -7,6 +7,7 @@
 
 #include "poly/nir/poly_nir.h"
 #include "compiler/nir/nir_builder.h"
+#include "compiler/nir/nir_builtin_builder.h"
 #include "gallium/include/pipe/p_defines.h"
 #include "poly/cl/libpoly.h"
 #include "poly/geometry.h"
@@ -170,6 +171,12 @@ struct lower_gs_state {
    int count_index[POLY_MAX_VERTEX_STREAMS];
 
    struct poly_gs_info *info;
+
+   /* Rasterizing triangles as points: each input primitive draws, per stream,
+    * polygon_tris triangles of polygon_candidates candidate points each
+    */
+   const struct poly_polygon_points *points;
+   unsigned polygon_tris, polygon_candidates;
 };
 
 /* Helpers for loading from the vertex state buffer */
@@ -212,6 +219,12 @@ struct lower_output_to_var_slot {
    nir_variable *selected_var;
    nir_alu_type type;
    unsigned nr_components;
+
+   /* Rasterizing triangles as points: the stream's last three vertices, and
+    * the vertices of the selected triangle in its own order
+    */
+   nir_variable *ring[3];
+   nir_variable *corner[3];
 };
 
 static bool
@@ -536,6 +549,14 @@ struct lower_gs_rast_state {
    bool points;
 
    nir_variable *output_strip_length, *output_strip_base, *id_in_strip;
+
+   /* Rasterizing triangles as points: the triangle in its stream and the
+    * candidate point this invocation draws, the current strip's first vertex
+    * and number of triangles before it, and whether the triangle was found
+    */
+   bool polygon_points;
+   nir_def *tri, *candidate;
+   nir_variable *strip_first, *tri_base, *found;
 };
 
 static void
@@ -558,6 +579,85 @@ select_rast_output(nir_builder *b, nir_intrinsic_instr *intr,
    }
 }
 
+/* Keep the stream's last three vertices, and copy those of the selected
+ * triangle when its last vertex is emitted. The triangle's vertex k is the
+ * strip's vertex i + poly_map_vertex_in_tri_strip(i, k), i being the
+ * triangle's index in the strip.
+ */
+static void
+select_rast_triangle(nir_builder *b, nir_intrinsic_instr *intr,
+                     struct lower_gs_rast_state *state)
+{
+   b->cursor = nir_instr_remove(&intr->instr);
+   nir_def *us = nir_ieq_imm(b, state->stream, nir_intrinsic_stream_id(intr));
+
+   nir_def *p =
+      nir_isub(b, intr->src[0].ssa, nir_load_var(b, state->strip_first));
+   nir_def *i = nir_iadd_imm(b, p, -2);
+   nir_def *tri = nir_iadd(b, nir_load_var(b, state->tri_base), i);
+   nir_def *hit = nir_iand(
+      b, us, nir_iand(b, nir_uge_imm(b, p, 2), nir_ieq(b, tri, state->tri)));
+
+   nir_def *even = nir_ieq_imm(b, nir_iand_imm(b, i, 1), 0);
+   nir_def *first = nir_ieq_imm(b, nir_load_provoking_last(b), 0);
+   nir_def *first_or_even = nir_ior(b, first, even);
+   nir_def *last_or_even = nir_ior(b, nir_inot(b, first), even);
+
+   u_foreach_bit64(slot, b->shader->info.outputs_written) {
+      struct lower_output_to_var_slot *output = &state->outputs[slot];
+      nir_def *r[3] = {
+         nir_load_var(b, output->ring[1]),
+         nir_load_var(b, output->ring[2]),
+         nir_load_var(b, output->output_var),
+      };
+      unsigned mask = nir_component_mask(r[0]->num_components);
+
+      for (unsigned k = 0; k < 3; ++k) {
+         nir_def *old = nir_load_var(b, output->ring[k]);
+         nir_store_var(b, output->ring[k], nir_bcsel(b, us, r[k], old), mask);
+      }
+
+      nir_def *corner[3] = {
+         nir_bcsel(b, first_or_even, r[0], r[1]),
+         nir_bcsel(b, even, r[1], nir_bcsel(b, first, r[2], r[0])),
+         nir_bcsel(b, last_or_even, r[2], r[1]),
+      };
+
+      for (unsigned k = 0; k < 3; ++k) {
+         nir_def *old = nir_load_var(b, output->corner[k]);
+         nir_store_var(b, output->corner[k], nir_bcsel(b, hit, corner[k], old),
+                       mask);
+      }
+   }
+
+   nir_store_var(b, state->found,
+                 nir_ior(b, nir_load_var(b, state->found), hit), 0x1);
+}
+
+/* A strip ended: the next one starts after it, with its triangles before */
+static void
+end_rast_strip(nir_builder *b, nir_intrinsic_instr *intr,
+               struct lower_gs_rast_state *state)
+{
+   b->cursor = nir_instr_remove(&intr->instr);
+   nir_def *us = nir_ieq_imm(b, state->stream, nir_intrinsic_stream_id(intr));
+
+   nir_def *first = intr->src[1].ssa;
+   nir_def *length = intr->src[2].ssa;
+   nir_def *prims_before = intr->src[3].ssa;
+   nir_def *tris = nir_bcsel(b, nir_uge_imm(b, length, 3),
+                             nir_iadd_imm(b, length, -2), nir_imm_int(b, 0));
+
+   nir_def *next = nir_iadd(b, first, length);
+   nir_store_var(b, state->strip_first,
+                 nir_bcsel(b, us, next, nir_load_var(b, state->strip_first)),
+                 0x1);
+
+   nir_def *base = nir_iadd(b, prims_before, tris);
+   nir_store_var(b, state->tri_base,
+                 nir_bcsel(b, us, base, nir_load_var(b, state->tri_base)), 0x1);
+}
+
 static bool
 lower_to_gs_rast(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
@@ -569,7 +669,10 @@ lower_to_gs_rast(nir_builder *b, nir_intrinsic_instr *intr, void *data)
       return true;
 
    case nir_intrinsic_select_vertex_poly:
-      select_rast_output(b, intr, state);
+      if (state->polygon_points)
+         select_rast_triangle(b, intr, state);
+      else
+         select_rast_output(b, intr, state);
       return true;
 
    case nir_intrinsic_load_primitive_id:
@@ -592,6 +695,11 @@ lower_to_gs_rast(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    }
 
    case nir_intrinsic_emit_primitive_poly: {
+      if (state->polygon_points) {
+         end_rast_strip(b, intr, state);
+         return true;
+      }
+
       b->cursor = nir_before_instr(&intr->instr);
       nir_def *id = state->output_id;
 
@@ -677,6 +785,399 @@ stream_multiplier(const nir_shader *gs)
    return util_next_power_of_two(nr_streams);
 }
 
+/* v times the scalar weight w */
+static nir_def *
+scale_output(nir_builder *b, nir_def *v, nir_def *w)
+{
+   w = nir_f2fN(b, w, v->bit_size);
+   return nir_fmul(b, v, nir_replicate(b, w, v->num_components));
+}
+
+/* w[0] * v[0] + w[1] * v[1] + w[2] * v[2] */
+static nir_def *
+weigh_corners(nir_builder *b, nir_def *const *w, nir_def *const *v)
+{
+   nir_def *sum = scale_output(b, v[0], w[0]);
+   sum = nir_fadd(b, sum, scale_output(b, v[1], w[1]));
+   return nir_fadd(b, sum, scale_output(b, v[2], w[2]));
+}
+
+/* Determinant of the rows (a[k], b[k], c[k]) */
+static nir_def *
+det3(nir_builder *b, nir_def *const *a, nir_def *const *b_, nir_def *const *c)
+{
+   nir_def *row[3];
+   for (unsigned k = 0; k < 3; ++k)
+      row[k] = nir_vec3(b, a[k], b_[k], c[k]);
+
+   return nir_fdot(b, row[0], nir_cross3(b, row[1], row[2]));
+}
+
+/* Load a component of an output's corners, if it is written */
+static bool
+load_output_corners(nir_builder *b, struct lower_output_to_var_slot *outputs,
+                    unsigned slot, unsigned component, nir_def **out)
+{
+   if (!(b->shader->info.outputs_written & BITFIELD64_BIT(slot)) ||
+       component >= outputs[slot].nr_components)
+      return false;
+
+   for (unsigned k = 0; k < 3; ++k)
+      out[k] =
+         nir_channel(b, nir_load_var(b, outputs[slot].corner[k]), component);
+   return true;
+}
+
+/* Transform feedback captures the triangle, not its points: its first three
+ * candidates write its vertices.
+ */
+static void
+write_polygon_xfb(nir_builder *b, const nir_shader *gs,
+                  const struct lower_gs_state *state,
+                  struct lower_gs_rast_state *rs)
+{
+   struct nir_xfb_info *xfb = gs->xfb_info;
+   nir_def *k = rs->candidate;
+
+   nir_def *unrolled =
+      nir_iadd(b, nir_imul(b, rs->instance_id, load_geometry_param(b, grid[0])),
+               rs->primitive_id);
+
+   nir_push_if(b,
+               nir_iand(b, nir_load_var(b, rs->found), nir_ult_imm(b, k, 3)));
+   for (unsigned i = 0; i < xfb->output_count; ++i) {
+      nir_xfb_output_info output = xfb->outputs[i];
+      unsigned stream = xfb->buffer_to_stream[output.buffer];
+      nir_push_if(b, nir_ieq_imm(b, rs->stream, stream));
+
+      nir_def *invocation_base = poly_previous_xfb_primitives(
+         b, nir_load_geometry_param_buffer_poly(b),
+         nir_imm_int(b, state->static_count[stream]),
+         nir_imm_int(b, state->count_index[stream]),
+         nir_imm_int(b, state->info->count_words),
+         nir_imm_bool(b, state->info->prefix_sum), unrolled);
+
+      nir_def *prim = nir_iadd(b, invocation_base, rs->tri);
+      nir_def *index = nir_iadd(b, nir_imul_imm(b, prim, 3), k);
+
+      nir_def *xfb_verts = load_geometry_param(b, xfb_verts[stream]);
+      nir_push_if(b, nir_ult(b, index, xfb_verts));
+      {
+         unsigned buffer = output.buffer;
+         unsigned stride = xfb->buffers[buffer].stride;
+         struct lower_output_to_var_slot *slot = &rs->outputs[output.location];
+
+         nir_def *value;
+         if (slot->corner[0]) {
+            nir_def *c[3];
+            for (unsigned j = 0; j < 3; ++j)
+               c[j] = nir_load_var(b, slot->corner[j]);
+
+            value = nir_bcsel(b, nir_ieq_imm(b, k, 0), c[0],
+                              nir_bcsel(b, nir_ieq_imm(b, k, 1), c[1], c[2]));
+         } else {
+            value = nir_undef(b, 4, 32);
+         }
+
+         value = nir_pad_vector_imm_int(b, value, 0, 4);
+
+         nir_def *addr = poly_xfb_vertex_address(
+            b, nir_load_geometry_param_buffer_poly(b), index,
+            nir_imm_int(b, buffer), nir_imm_int(b, stride),
+            nir_imm_int(b, output.offset));
+
+         nir_store_global(b, nir_channels(b, value, output.component_mask),
+                          addr);
+      }
+      nir_pop_if(b, NULL);
+      nir_pop_if(b, NULL);
+   }
+   nir_pop_if(b, NULL);
+}
+
+static nir_def *
+rasterizer_flag(nir_builder *b, nir_def *state, enum poly_rasterizer_state flag)
+{
+   return nir_ine_imm(b, nir_iand_imm(b, state, flag), 0);
+}
+
+/*
+ * Draw a candidate point of the selected triangle. The clipped polygon is the
+ * part of the triangle where its barycentrics and the plane distances are all
+ * non-negative, each a linear function of the barycentrics. Its vertices are
+ * where two of these constraints are zero and the others are not negative, so
+ * each pair of constraints is a candidate point, drawn if it is such a vertex.
+ * A vertex where more than two are zero is drawn once, by the pair of its two
+ * lowest constraints.
+ */
+static void
+emit_polygon_point(nir_builder *b, const nir_shader *gs,
+                   const struct lower_gs_state *state,
+                   struct lower_gs_rast_state *rs)
+{
+   const struct poly_polygon_points *points = state->points;
+   struct lower_output_to_var_slot *outputs = rs->outputs;
+   uint64_t written = b->shader->info.outputs_written;
+   unsigned nr_clip = gs->info.clip_distance_array_size;
+   unsigned nr_cull = gs->info.cull_distance_array_size;
+
+   nir_def *zero = nir_imm_float(b, 0.0);
+   nir_def *one = nir_imm_float(b, 1.0);
+   nir_def *first = nir_ieq_imm(b, nir_load_provoking_last(b), 0);
+
+   if (!(written & VARYING_BIT_POS)) {
+      nir_store_output(b, nir_imm_vec4(b, NAN, NAN, NAN, NAN),
+                       nir_imm_int(b, 0), .src_type = nir_type_float32,
+                       .io_semantics.location = VARYING_SLOT_POS);
+      b->shader->info.outputs_written |= VARYING_BIT_POS;
+      return;
+   }
+
+   nir_def *x[3], *y[3], *z[3], *w[3];
+   load_output_corners(b, outputs, VARYING_SLOT_POS, 0, x);
+   load_output_corners(b, outputs, VARYING_SLOT_POS, 1, y);
+   load_output_corners(b, outputs, VARYING_SLOT_POS, 2, z);
+   load_output_corners(b, outputs, VARYING_SLOT_POS, 3, w);
+
+   /* The viewport is the polygon's, from its provoking vertex */
+   nir_def *vp_index = nir_imm_int(b, 0);
+   nir_def *vp_corners[3];
+   if (load_output_corners(b, outputs, VARYING_SLOT_VIEWPORT, 0, vp_corners))
+      vp_index = nir_bcsel(b, first, vp_corners[0], vp_corners[2]);
+
+   nir_def *vp = nir_load_viewport_transform_poly(b, vp_index);
+   nir_def *x_scale = nir_channel(b, vp, 0);
+   nir_def *y_scale = nir_channel(b, vp, 1);
+   nir_def *z_scale = nir_channel(b, vp, 2);
+   nir_def *z_offset = nir_channel(b, vp, 3);
+
+   nir_def *rast = nir_load_rasterizer_state_poly(b);
+
+   /* Depth in [0, w], whatever the clip space depth range */
+   nir_def *clip_z_coeff = nir_load_clip_z_coeff(b);
+   nir_def *zw[3];
+   for (unsigned k = 0; k < 3; ++k)
+      zw[k] = nir_flrp(b, z[k], w[k], clip_z_coeff);
+
+   /* The homogeneous determinant of (x, y, w) has the sign of the area in
+    * normalized device coordinates. Vulkan's area in framebuffer coordinates
+    * is its opposite, scaled by the viewport.
+    */
+   nir_def *det_xyw = det3(b, x, y, w);
+   nir_def *area = nir_fneg(b, nir_fmul(b, det_xyw, y_scale));
+   nir_def *front =
+      nir_bcsel(b, rasterizer_flag(b, rast, POLY_RASTERIZER_FRONT_CCW),
+                nir_flt(b, zero, area), nir_flt(b, area, zero));
+   nir_def *cull_front = rasterizer_flag(b, rast, POLY_RASTERIZER_CULL_FRONT);
+   nir_def *cull_back = rasterizer_flag(b, rast, POLY_RASTERIZER_CULL_BACK);
+   nir_def *culled = nir_ior(b, nir_iand(b, front, cull_front),
+                             nir_iand(b, nir_inot(b, front), cull_back));
+
+   /* Cull distances follow the clip distances in CLIP_DIST0 and 1 */
+   for (unsigned i = nr_clip; i < nr_clip + nr_cull; ++i) {
+      nir_def *d[3];
+      if (!load_output_corners(b, outputs, VARYING_SLOT_CLIP_DIST0 + i / 4,
+                               i % 4, d))
+         continue;
+
+      nir_def *outside =
+         nir_iand(b, nir_flt(b, d[0], zero),
+                  nir_iand(b, nir_flt(b, d[1], zero), nir_flt(b, d[2], zero)));
+      culled = nir_ior(b, culled, outside);
+   }
+
+   /* Constraints: the barycentrics, the near and far planes, unless depth
+    * clipping is off, and the clip distances. One that is always positive
+    * takes the place of one that is off.
+    */
+   assert(nr_clip <= 8);
+   nir_def *constraint[3 + 2 + 8];
+   unsigned nr_constraints = 0;
+   constraint[nr_constraints++] = nir_imm_vec3(b, 1.0, 0.0, 0.0);
+   constraint[nr_constraints++] = nir_imm_vec3(b, 0.0, 1.0, 0.0);
+   constraint[nr_constraints++] = nir_imm_vec3(b, 0.0, 0.0, 1.0);
+
+   nir_def *depth_clip = rasterizer_flag(b, rast, POLY_RASTERIZER_DEPTH_CLIP);
+   nir_def *inside = nir_imm_vec3(b, 1.0, 1.0, 1.0);
+   nir_def *near = nir_vec3(b, zw[0], zw[1], zw[2]);
+   nir_def *far = nir_vec3(b, nir_fsub(b, w[0], zw[0]),
+                           nir_fsub(b, w[1], zw[1]), nir_fsub(b, w[2], zw[2]));
+   constraint[nr_constraints++] = nir_bcsel(b, depth_clip, near, inside);
+   constraint[nr_constraints++] = nir_bcsel(b, depth_clip, far, inside);
+
+   for (unsigned i = 0; i < nr_clip; ++i) {
+      nir_def *d[3];
+      if (load_output_corners(b, outputs, VARYING_SLOT_CLIP_DIST0 + i / 4,
+                              i % 4, d))
+         constraint[nr_constraints++] = nir_vec3(b, d[0], d[1], d[2]);
+      else
+         constraint[nr_constraints++] = inside;
+   }
+   assert(nr_constraints * (nr_constraints - 1) / 2 ==
+          state->polygon_candidates);
+
+   /* Candidates enumerate the pairs (0, 1), (0, 2), (1, 2), (0, 3)... */
+   nir_def *lo = rs->candidate;
+   nir_def *hi = nir_imm_int(b, 1);
+   for (unsigned j = 2; j < nr_constraints; ++j) {
+      unsigned base = j * (j - 1) / 2;
+      nir_def *in_j = nir_uge_imm(b, rs->candidate, base);
+      hi = nir_bcsel(b, in_j, nir_imm_int(b, j), hi);
+      lo =
+         nir_bcsel(b, in_j, nir_iadd_imm(b, rs->candidate, -(int64_t)base), lo);
+   }
+
+   nir_def *lambda_lo = constraint[0], *lambda_hi = constraint[0];
+   for (unsigned m = 1; m < nr_constraints; ++m) {
+      lambda_lo = nir_bcsel(b, nir_ieq_imm(b, lo, m), constraint[m], lambda_lo);
+      lambda_hi = nir_bcsel(b, nir_ieq_imm(b, hi, m), constraint[m], lambda_hi);
+   }
+
+   /* Barycentrics zeroing both constraints and summing to one, NaN or
+    * infinite if there are none
+    */
+   nir_def *cross = nir_cross3(b, lambda_lo, lambda_hi);
+   nir_def *sum =
+      nir_fadd(b, nir_channel(b, cross, 0),
+               nir_fadd(b, nir_channel(b, cross, 1), nir_channel(b, cross, 2)));
+   nir_def *bary[3];
+   for (unsigned k = 0; k < 3; ++k)
+      bary[k] = nir_fdiv(b, nir_channel(b, cross, k), sum);
+
+   nir_def *bary_vec = nir_vec3(b, bary[0], bary[1], bary[2]);
+   nir_def *valid = nir_load_var(b, rs->found);
+   valid = nir_iand(b, valid, nir_ult(b, lo, hi));
+   for (unsigned m = 0; m < nr_constraints; ++m) {
+      nir_def *d = nir_fdot(b, constraint[m], bary_vec);
+      nir_def *pair = nir_ior(b, nir_ieq_imm(b, lo, m), nir_ieq_imm(b, hi, m));
+      nir_def *ok = nir_bcsel(b, nir_ugt_imm(b, hi, m), nir_flt(b, zero, d),
+                              nir_fge(b, d, zero));
+      valid = nir_iand(b, valid, nir_ior(b, pair, ok));
+   }
+
+   /* The point in clip space, in front of the viewer */
+   nir_def *pos_corners[3];
+   for (unsigned k = 0; k < 3; ++k)
+      pos_corners[k] = nir_vec4(b, x[k], y[k], z[k], w[k]);
+
+   nir_def *pos = weigh_corners(b, bary, pos_corners);
+   nir_def *pos_w = nir_channel(b, pos, 3);
+   valid = nir_iand(b, valid, nir_flt(b, zero, pos_w));
+
+   nir_def *draw = nir_iand(b, valid, nir_inot(b, culled));
+   if (state->info->multistream) {
+      draw = nir_iand(b, draw,
+                      nir_ieq(b, rs->stream, nir_load_rasterization_stream(b)));
+   }
+
+   /* Framebuffer depth, written as is: the viewport depth range is [0, 1] */
+   nir_def *point_zw = weigh_corners(b, bary, zw);
+   nir_def *depth =
+      nir_ffma(b, z_scale, nir_fdiv(b, point_zw, pos_w), z_offset);
+
+   /* Depth bias, from the polygon's slope in framebuffer coordinates, taken
+    * from the plane through its homogeneous vertices.
+    */
+   nir_def *bias = nir_load_depth_bias_poly(b);
+   nir_def *dz_dx = nir_fdiv(b, nir_fneg(b, det3(b, y, zw, w)), det_xyw);
+   nir_def *dz_dy = nir_fdiv(b, det3(b, x, zw, w), det_xyw);
+   nir_def *slope_x =
+      nir_fabs(b, nir_fmul(b, nir_fdiv(b, z_scale, x_scale), dz_dx));
+   nir_def *slope_y =
+      nir_fabs(b, nir_fmul(b, nir_fdiv(b, z_scale, y_scale), dz_dy));
+   nir_def *slope = nir_fmax(b, slope_x, slope_y);
+   slope = nir_bcsel(b, nir_feq(b, det_xyw, zero), zero, slope);
+
+   /* A floating-point format's minimum resolvable difference depends on the
+    * largest depth of the polygon
+    */
+   nir_def *max_depth = zero;
+   for (unsigned k = 0; k < 3; ++k) {
+      nir_def *d = nir_ffma(b, z_scale, nir_fdiv(b, zw[k], w[k]), z_offset);
+      d = nir_bcsel(b, nir_flt(b, zero, w[k]), nir_fsat(b, d), zero);
+      max_depth = nir_fmax(b, max_depth, d);
+   }
+
+   nir_def *exponent = nir_ubitfield_extract_imm(b, max_depth, 23, 8);
+   nir_def *float_r = nir_ishl_imm(
+      b, nir_imax(b, nir_iadd_imm(b, exponent, -23), nir_imm_int(b, 1)), 23);
+   nir_def *r = nir_channel(b, bias, 3);
+   r = nir_bcsel(b, nir_flt(b, zero, r), r, float_r);
+
+   nir_def *offset = nir_fmul(b, slope, nir_channel(b, bias, 1));
+   offset = nir_ffma(b, r, nir_channel(b, bias, 0), offset);
+
+   nir_def *bias_clamp = nir_channel(b, bias, 2);
+   offset = nir_bcsel(b, nir_flt(b, zero, bias_clamp),
+                      nir_fmin(b, offset, bias_clamp),
+                      nir_bcsel(b, nir_flt(b, bias_clamp, zero),
+                                nir_fmax(b, offset, bias_clamp), offset));
+
+   depth = nir_bcsel(b, rasterizer_flag(b, rast, POLY_RASTERIZER_DEPTH_BIAS),
+                     nir_fadd(b, depth, offset), depth);
+
+   nir_def *z_far = nir_fadd(b, z_offset, z_scale);
+   nir_def *clamped = nir_fclamp(b, depth, nir_fmin(b, z_offset, z_far),
+                                 nir_fmax(b, z_offset, z_far));
+   depth = nir_bcsel(b, rasterizer_flag(b, rast, POLY_RASTERIZER_DEPTH_CLAMP),
+                     clamped, depth);
+
+   pos = nir_vector_insert_imm(b, pos, nir_fmul(b, depth, pos_w), 2);
+   pos = nir_bcsel(b, draw, pos, nir_imm_vec4(b, NAN, NAN, NAN, NAN));
+   nir_store_output(b, pos, nir_imm_int(b, 0), .src_type = nir_type_float32,
+                    .io_semantics.location = VARYING_SLOT_POS);
+
+   /* Weights of outputs interpolated linearly in framebuffer space */
+   nir_def *linear[3];
+   for (unsigned k = 0; k < 3; ++k)
+      linear[k] = nir_fdiv(b, nir_fmul(b, bary[k], w[k]), pos_w);
+
+   u_foreach_bit64(slot, written) {
+      struct lower_output_to_var_slot *output = &outputs[slot];
+      if (slot == VARYING_SLOT_POS)
+         continue;
+
+      nir_def *c[3];
+      for (unsigned k = 0; k < 3; ++k)
+         c[k] = nir_load_var(b, output->corner[k]);
+
+      nir_def *value;
+      bool is_float =
+         nir_alu_type_get_base_type(output->type) == nir_type_float;
+      if (!is_float || (points->flat_outputs & BITFIELD64_BIT(slot)))
+         value = nir_bcsel(b, first, c[0], c[2]);
+      else if (points->noperspective_outputs & BITFIELD64_BIT(slot))
+         value = weigh_corners(b, linear, c);
+      else
+         value = weigh_corners(b, bary, c);
+
+      /* Clip distances were applied, the clipped vertices' are zero */
+      if (slot == VARYING_SLOT_CLIP_DIST0 || slot == VARYING_SLOT_CLIP_DIST1) {
+         unsigned base = (slot - VARYING_SLOT_CLIP_DIST0) * 4;
+         for (unsigned i = 0; i < value->num_components; ++i) {
+            if (base + i < nr_clip) {
+               nir_def *d = nir_fmax(b, nir_channel(b, value, i), zero);
+               value = nir_vector_insert_imm(b, value, d, i);
+            }
+         }
+      }
+
+      nir_store_output(b, value, nir_imm_int(b, 0), .src_type = output->type,
+                       .io_semantics.location = slot);
+   }
+
+   nir_store_output(b, one, nir_imm_int(b, 0), .src_type = nir_type_float32,
+                    .io_semantics.location = VARYING_SLOT_PSIZ);
+   b->shader->info.outputs_written |= VARYING_BIT_PSIZ;
+
+   if (points->facing_slot) {
+      nir_store_output(b, nir_b2i32(b, front), nir_imm_int(b, 0),
+                       .src_type = nir_type_uint32,
+                       .io_semantics.location = points->facing_slot);
+      b->shader->info.outputs_written |= BITFIELD64_BIT(points->facing_slot);
+   }
+}
+
 /*
  * Create a GS rasterization shader. This is a hardware vertex shader that
  * shades each rasterized output vertex in parallel.
@@ -710,7 +1211,8 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
    nir_builder *b = &b_;
 
    const glsl_type *T = glsl_uint_type();
-   nir_def *raw_vertex_id = nir_load_vertex_id(b);
+   nir_def *vertex_id = nir_load_vertex_id(b);
+   nir_def *raw_vertex_id = vertex_id;
 
    struct lower_gs_rast_state rs = {
       .raw_instance_id = nir_load_instance_id(b),
@@ -719,6 +1221,7 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
       .output_strip_length = nir_local_variable_create(b->impl, T, NULL),
       .output_strip_base = nir_local_variable_create(b->impl, T, NULL),
       .id_in_strip = nir_local_variable_create(b->impl, T, NULL),
+      .polygon_points = state->points != NULL,
    };
 
    raw_vertex_id = nir_udiv_imm(b, raw_vertex_id, stream_multiplier(gs));
@@ -760,6 +1263,31 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
       UNREACHABLE("invalid shape");
    }
 
+   /* Each input primitive draws, per stream, its candidate points of each of
+    * its possible triangles
+    */
+   if (rs.polygon_points) {
+      unsigned candidates = state->polygon_candidates;
+      unsigned per_stream = state->polygon_tris * candidates;
+      unsigned per_prim = state->info->max_indices;
+      nir_def *output_id = nir_umod_imm(b, vertex_id, per_prim);
+
+      rs.primitive_id = nir_udiv_imm(b, vertex_id, per_prim);
+      rs.instance_id = rs.raw_instance_id;
+      rs.stream = nir_udiv_imm(b, output_id, per_stream);
+      rs.tri =
+         nir_udiv_imm(b, nir_umod_imm(b, output_id, per_stream), candidates);
+      rs.candidate = nir_umod_imm(b, output_id, candidates);
+      rs.output_id = output_id;
+
+      rs.strip_first = nir_local_variable_create(b->impl, T, NULL);
+      rs.tri_base = nir_local_variable_create(b->impl, T, NULL);
+      rs.found = nir_local_variable_create(b->impl, glsl_bool_type(), NULL);
+      nir_store_var(b, rs.strip_first, nir_imm_int(b, 0), 0x1);
+      nir_store_var(b, rs.tri_base, nir_imm_int(b, 0), 0x1);
+      nir_store_var(b, rs.found, nir_imm_false(b), 0x1);
+   }
+
    nir_shader_intrinsics_pass(shader, collect_output_types, nir_metadata_all,
                               rs.outputs);
 
@@ -778,12 +1306,34 @@ create_gs_rast_shader(const nir_shader *gs, const struct lower_gs_state *state)
       output->selected_var = nir_variable_create(
          shader, nir_var_shader_temp, glsl_vector_type(type, output->nr_components),
          ralloc_asprintf(shader, "%s-selected", slot_name));
+
+      if (rs.polygon_points) {
+         for (unsigned k = 0; k < 3; ++k) {
+            output->ring[k] = nir_variable_create(
+               shader, nir_var_shader_temp,
+               glsl_vector_type(type, output->nr_components),
+               ralloc_asprintf(shader, "%s-ring%u", slot_name, k));
+
+            output->corner[k] = nir_variable_create(
+               shader, nir_var_shader_temp,
+               glsl_vector_type(type, output->nr_components),
+               ralloc_asprintf(shader, "%s-corner%u", slot_name, k));
+         }
+      }
    }
 
    NIR_PASS(_, shader, nir_shader_intrinsics_pass, lower_to_gs_rast,
             nir_metadata_control_flow, &rs);
 
    b->cursor = nir_after_impl(b->impl);
+
+   if (rs.polygon_points) {
+      if (gs->xfb_info)
+         write_polygon_xfb(b, gs, state, &rs);
+
+      emit_polygon_point(b, gs, state, &rs);
+      return shader;
+   }
    if (gs->xfb_info) {
       unsigned n_ = mesa_vertices_per_prim(gs->info.gs.output_primitive);
       nir_def *zero = nir_imm_int(b, 0);
@@ -1242,8 +1792,13 @@ optimize_static_topology(struct poly_gs_info *info, nir_shader *gs)
 
 bool
 poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
-                  nir_shader **pre_gs, struct poly_gs_info *info)
+                  nir_shader **pre_gs, struct poly_gs_info *info,
+                  const struct poly_polygon_points *points)
 {
+   /* Only triangles are rasterized as points */
+   if (gs->info.gs.output_primitive != MESA_PRIM_TRIANGLE_STRIP)
+      points = NULL;
+
    /* Lower I/O as assumed by the rest of GS lowering */
    if (gs->xfb_info != NULL) {
       /* Fold constant offset srcs for IO. */
@@ -1349,6 +1904,33 @@ poly_nir_lower_gs(nir_shader *gs, nir_shader **gs_count, nir_shader **gs_copy,
       optimize_static_topology(info, gs);
    } else {
       info->shape = POLY_GS_SHAPE_DYNAMIC_INDEXED;
+   }
+
+   /* Rasterizing triangles as points draws, without indices, the candidate
+    * points of as many triangles as an invocation may emit per stream. A
+    * triangle's candidates are the pairs of its 3 barycentric constraints, the
+    * near and far planes and its clip distances.
+    */
+   if (points) {
+      unsigned vertices = gs->info.gs.vertices_out;
+      unsigned dynamic_tris = vertices >= 3 ? vertices - 2 : 0;
+      unsigned tris = 0;
+      u_foreach_bit(stream, gs->info.gs.active_stream_mask) {
+         int count = gs_state.static_count[stream];
+         tris = MAX2(tris, count >= 0 ? (unsigned)count : dynamic_tris);
+      }
+
+      unsigned constraints = 3 + 2 + gs->info.clip_distance_array_size;
+
+      gs_state.points = points;
+      gs_state.polygon_tris = MAX2(tris, 1);
+      gs_state.polygon_candidates = constraints * (constraints - 1) / 2;
+
+      info->polygon_points = true;
+      info->mode = MESA_PRIM_POINTS;
+      info->shape = POLY_GS_SHAPE_STATIC_PER_INSTANCE;
+      info->max_indices = util_last_bit(gs->info.gs.active_stream_mask) *
+                          gs_state.polygon_tris * gs_state.polygon_candidates;
    }
 
    /* Ensure that outputs_written is still accurate after DCE. */

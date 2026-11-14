@@ -49,6 +49,18 @@ enum poly_gs_shape {
    POLY_GS_SHAPE_STATIC_PER_INSTANCE,
 };
 
+/* Rasterizer state that a GS rasterizing its triangles as points applies,
+ * returned by load_rasterizer_state_poly
+ */
+enum poly_rasterizer_state {
+   POLY_RASTERIZER_CULL_FRONT = (1u << 0),
+   POLY_RASTERIZER_CULL_BACK = (1u << 1),
+   POLY_RASTERIZER_FRONT_CCW = (1u << 2),
+   POLY_RASTERIZER_DEPTH_CLIP = (1u << 3),
+   POLY_RASTERIZER_DEPTH_CLAMP = (1u << 4),
+   POLY_RASTERIZER_DEPTH_BIAS = (1u << 5),
+};
+
 static inline unsigned
 poly_gs_rast_vertices(enum poly_gs_shape shape, unsigned max_indices,
                       unsigned input_primitives, unsigned instance_count)

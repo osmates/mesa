@@ -1612,6 +1612,20 @@ system_value("tess_param_buffer_poly", 1, bit_sizes=[64])
 # Address of the pipeline statistic query result indexed by BASE
 system_value("stat_query_address_poly", 1, bit_sizes=[64], indices=[BASE])
 
+# Rasterizer state of a poly GS rasterizing its triangles as points, a mask of
+# poly_rasterizer_state.
+system_value("rasterizer_state_poly", 1)
+
+# Depth bias of a poly GS rasterizing its triangles as points: constant factor,
+# slope factor, clamp and the depth format's minimum resolvable difference, or
+# zero for a floating-point format.
+system_value("depth_bias_poly", 4)
+
+# Viewport transform of a poly GS rasterizing its triangles as points, for the
+# viewport index in src[0]: x scale, y scale, z scale and z offset.
+intrinsic("load_viewport_transform_poly", src_comp=[1], dest_comp=4,
+          flags=[CAN_ELIMINATE, CAN_REORDER], bit_sizes=[32])
+
 # IR3-specific version of most SSBO intrinsics. The only different
 # compare to the originals is that they add an extra source to hold
 # the dword-offset, which is needed by the backend code apart from

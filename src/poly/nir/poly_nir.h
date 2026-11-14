@@ -46,11 +46,32 @@ struct poly_gs_info {
 
    /* Static topology used if shape = POLY_GS_SHAPE_STATIC_INDEXED */
    uint8_t topology[64];
+
+   /* Whether the GS's triangles are rasterized as points, mode being points */
+   bool polygon_points;
+};
+
+/* Rasterize the triangles a GS outputs as points, as VK_POLYGON_MODE_POINT
+ * does. Each triangle is culled by its facing and its cull distances, and
+ * clipped against the near and far planes and its clip distances, before the
+ * vertices of the clipped polygon are drawn as points of size 1. Transform
+ * feedback still captures the triangles.
+ */
+struct poly_polygon_points {
+   /* Varying slots the fragment shader reads flat or without perspective */
+   uint64_t flat_outputs;
+   uint64_t noperspective_outputs;
+
+   /* Varying slot the polygon's facing is written to as a flat 32-bit
+    * integer, or zero if the fragment shader does not read it
+    */
+   unsigned facing_slot;
 };
 
 bool poly_nir_lower_gs(struct nir_shader *gs, struct nir_shader **gs_count,
                        struct nir_shader **gs_copy, struct nir_shader **pre_gs,
-                       struct poly_gs_info *info);
+                       struct poly_gs_info *info,
+                       const struct poly_polygon_points *points);
 
 bool poly_nir_lower_tcs(struct nir_shader *tcs,
                         bool can_ignore_shader_out_barriers);
