@@ -746,6 +746,7 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
 {
    const struct vk_dynamic_graphics_state *dyn =
       &cmd->vk.dynamic_graphics_state;
+   bool polygon_points = cmd->state.gfx.polygon_points;
 
    /* We always need at least 1 viewport for the hardware. With rasterizer
     * discard the app may not supply any, but we can just program garbage.
@@ -792,14 +793,15 @@ kk_flush_vp_state(struct kk_cmd_buffer *cmd)
       viewports[i].width = vp->width;
       viewports[i].height = -vp->height;
 
-      if (dyn->rs.depth_clamp_enable ||
-          vk_rasterization_state_depth_clip_enable(&dyn->rs)) {
+      if (!polygon_points &&
+          (dyn->rs.depth_clamp_enable ||
+           vk_rasterization_state_depth_clip_enable(&dyn->rs))) {
          viewports[i].znear = vp->minDepth;
          viewports[i].zfar = vp->maxDepth;
       } else {
          /* When clamp and clip are disabled, we set the viewport Z range to
           * [0, 1] to disable hardware clamping. The viewport transform will be
-          * applied in shader */
+          * applied in shader, as for triangles drawn as points */
          viewports[i].znear = 0.f;
          viewports[i].zfar = 1.f;
       }
@@ -855,6 +857,92 @@ kk_gs_adjacency(struct kk_cmd_buffer *cmd)
    return vs->pipeline.gfx.render_adjacency &&
           mesa_prim_has_adjacency(vk_topology_to_mesa(
              cmd->vk.dynamic_graphics_state.ia.primitive_topology));
+}
+
+/* Whether a GS draws the triangles as points */
+static bool
+kk_polygon_points(struct kk_cmd_buffer *cmd)
+{
+   const struct poly_gs_info *gs = kk_gs_info(cmd);
+   return gs && gs->polygon_points;
+}
+
+/* Metal's front face, which tessellation flips with its winding */
+static bool
+kk_front_face_ccw(struct kk_cmd_buffer *cmd)
+{
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+
+   bool front_face_ccw = dyn->rs.front_face != VK_FRONT_FACE_CLOCKWISE;
+   if (cmd->state.shaders[MESA_SHADER_TESS_EVAL]) {
+      front_face_ccw ^= cmd->state.gfx.tess.info.ccw;
+      front_face_ccw ^=
+         dyn->ts.domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
+   }
+
+   return front_face_ccw;
+}
+
+/* The minimum resolvable difference of a fixed-point depth format, or zero
+ * for a floating-point one, whose difference depends on the depth */
+static float
+kk_depth_bias_r(VkFormat format)
+{
+   if (format == VK_FORMAT_UNDEFINED || !vk_format_has_depth(format))
+      return 0.0f;
+
+   const struct util_format_description *desc = vk_format_description(format);
+   const struct util_format_channel_description *depth =
+      &desc->channel[desc->swizzle[0]];
+
+   if (depth->type == UTIL_FORMAT_TYPE_FLOAT)
+      return 0.0f;
+
+   return ldexpf(1.0f, -(int)depth->size);
+}
+
+/* The rasterizer state the GS drawing triangles as points applies */
+static void
+kk_flush_polygon_points(struct kk_cmd_buffer *cmd)
+{
+   struct kk_graphics_state *gfx = &cmd->state.gfx;
+   struct kk_descriptor_state *desc = &gfx->descriptors;
+   const struct vk_dynamic_graphics_state *dyn =
+      &cmd->vk.dynamic_graphics_state;
+
+   uint32_t state = 0;
+   if (dyn->rs.cull_mode & VK_CULL_MODE_FRONT_BIT)
+      state |= POLY_RASTERIZER_CULL_FRONT;
+   if (dyn->rs.cull_mode & VK_CULL_MODE_BACK_BIT)
+      state |= POLY_RASTERIZER_CULL_BACK;
+   if (kk_front_face_ccw(cmd))
+      state |= POLY_RASTERIZER_FRONT_CCW;
+   if (vk_rasterization_state_depth_clip_enable(&dyn->rs))
+      state |= POLY_RASTERIZER_DEPTH_CLIP;
+   if (dyn->rs.depth_clamp_enable)
+      state |= POLY_RASTERIZER_DEPTH_CLAMP;
+   if (dyn->rs.depth_bias.enable)
+      state |= POLY_RASTERIZER_DEPTH_BIAS;
+
+   desc->root.draw.rasterizer_state = state;
+   desc->root.draw.depth_bias[0] = dyn->rs.depth_bias.constant_factor;
+   desc->root.draw.depth_bias[1] = dyn->rs.depth_bias.slope_factor;
+   desc->root.draw.depth_bias[2] = dyn->rs.depth_bias.clamp;
+   desc->root.draw.depth_bias[3] =
+      kk_depth_bias_r(gfx->render.depth_att.vk_format);
+
+   for (uint32_t i = 0; i < dyn->vp.viewport_count; i++) {
+      const VkViewport *vp = &dyn->vp.viewports[i];
+      float *transform = &desc->root.draw.viewport_transform[i * 4];
+
+      transform[0] = vp->width * 0.5f;
+      transform[1] = vp->height * 0.5f;
+      transform[2] = vp->maxDepth - vp->minDepth;
+      transform[3] = vp->minDepth;
+   }
+
+   desc->root_dirty = true;
 }
 
 /* The GS output primitive if one is bound, otherwise the input topology */
@@ -1416,6 +1504,13 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
    struct vk_dynamic_graphics_state *dyn = &cmd->vk.dynamic_graphics_state;
    mtl_render_encoder *enc = cs_get_render(cmd);
 
+   /* Triangles drawn as points have their own depth state, which a new
+    * pipeline or encoder sets */
+   bool polygon_points = kk_polygon_points(cmd);
+   bool polygon_points_dirty = polygon_points != gfx->polygon_points ||
+                               (polygon_points && IS_SHADER_DIRTY(VERTEX));
+   gfx->polygon_points = polygon_points;
+
    if (IS_DIRTY(VI_BINDING_STRIDES)) {
       u_foreach_bit(ndx, dyn->vi->bindings_valid) {
          desc->root.draw.buffer_strides[ndx] = dyn->vi_binding_strides[ndx];
@@ -1465,7 +1560,8 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
    if (!(rast_discard || gfx->is_cull_front_and_back) &&
        (IS_DIRTY(VP_VIEWPORT_COUNT) || IS_DIRTY(VP_VIEWPORTS) ||
         IS_DIRTY(VP_SCISSOR_COUNT) || IS_DIRTY(VP_SCISSORS) ||
-        IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) || IS_DIRTY(RS_DEPTH_CLIP_ENABLE)))
+        IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) || IS_DIRTY(RS_DEPTH_CLIP_ENABLE) ||
+        polygon_points_dirty))
       kk_flush_vp_state(cmd);
 
    if (IS_DIRTY(VP_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE)) {
@@ -1476,19 +1572,15 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
 
    if (IS_DIRTY(RS_FRONT_FACE) || IS_DIRTY(TS_DOMAIN_ORIGIN) ||
        IS_SHADER_DIRTY(TESS_CTRL) || IS_SHADER_DIRTY(TESS_EVAL)) {
-      bool front_face_ccw = dyn->rs.front_face != VK_FRONT_FACE_CLOCKWISE;
-      if (cmd->state.shaders[MESA_SHADER_TESS_EVAL]) {
-         front_face_ccw ^= gfx->tess.info.ccw;
-         front_face_ccw ^=
-            dyn->ts.domain_origin == VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT;
-      }
-      mtl_set_front_face_winding(enc, front_face_ccw
+      mtl_set_front_face_winding(enc, kk_front_face_ccw(cmd)
                                          ? MTL_WINDING_COUNTER_CLOCKWISE
                                          : MTL_WINDING_CLOCKWISE);
    }
 
-   if (IS_DIRTY(RS_DEPTH_BIAS_FACTORS) || IS_DIRTY(RS_DEPTH_BIAS_ENABLE)) {
-      if (dyn->rs.depth_bias.enable)
+   /* Triangles drawn as points apply their polygon's bias themselves */
+   if (IS_DIRTY(RS_DEPTH_BIAS_FACTORS) || IS_DIRTY(RS_DEPTH_BIAS_ENABLE) ||
+       polygon_points_dirty) {
+      if (dyn->rs.depth_bias.enable && !polygon_points)
          mtl_set_depth_bias(enc, dyn->rs.depth_bias.constant_factor,
                             dyn->rs.depth_bias.slope_factor,
                             dyn->rs.depth_bias.clamp);
@@ -1497,7 +1589,8 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
    }
 
    if (IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) || IS_DIRTY(RS_DEPTH_CLIP_ENABLE) ||
-       IS_DIRTY(VP_VIEWPORT_COUNT) || IS_DIRTY(VP_VIEWPORTS)) {
+       IS_DIRTY(VP_VIEWPORT_COUNT) || IS_DIRTY(VP_VIEWPORTS) ||
+       polygon_points_dirty) {
       /* Mapping of Vulkan clamp/clip combinations to Metal:
        * - Clamp Off, Clip Off:
        *     Use Metal's clamp mode with the viewport depth range set to [0, 1],
@@ -1509,16 +1602,26 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
        *     Exact match to Metal's clamp mode.
        * - Clamp On, Clip On:
        *     Use Metal's clip mode, and emulate clamp in the fragment shader.
+       *
+       * Triangles drawn as points are clipped and clamped by the GS, which
+       * writes their framebuffer depth, the Z range being [0, 1] as for the
+       * first. The fragment shader clamps the depth it writes.
        */
       bool clamp = dyn->rs.depth_clamp_enable;
       bool clip = vk_rasterization_state_depth_clip_enable(&dyn->rs);
 
-      enum mtl_depth_clip_mode mode =
-         clip ? MTL_DEPTH_CLIP_MODE_CLIP : MTL_DEPTH_CLIP_MODE_CLAMP;
+      enum mtl_depth_clip_mode mode = clip && !polygon_points
+                                         ? MTL_DEPTH_CLIP_MODE_CLIP
+                                         : MTL_DEPTH_CLIP_MODE_CLAMP;
       mtl_set_depth_clip_mode(enc, mode);
 
-      desc->root.draw.emulate_depth_clamp = clamp && clip;
-      desc->root.draw.emulate_viewport_z = !clamp && !clip;
+      if (polygon_points) {
+         desc->root.draw.emulate_depth_clamp = clamp;
+         desc->root.draw.emulate_viewport_z = false;
+      } else {
+         desc->root.draw.emulate_depth_clamp = clamp && clip;
+         desc->root.draw.emulate_viewport_z = !clamp && !clip;
+      }
       if (desc->root.draw.emulate_depth_clamp ||
           desc->root.draw.emulate_viewport_z) {
          /* Ensure viewport depth ranges are up to date now, since we are
@@ -1541,6 +1644,15 @@ kk_flush_dynamic_state(struct kk_cmd_buffer *cmd)
       }
       desc->root_dirty = true;
    }
+
+   if (polygon_points &&
+       (polygon_points_dirty || IS_DIRTY(RS_CULL_MODE) ||
+        IS_DIRTY(RS_FRONT_FACE) || IS_DIRTY(TS_DOMAIN_ORIGIN) ||
+        IS_SHADER_DIRTY(TESS_CTRL) || IS_SHADER_DIRTY(TESS_EVAL) ||
+        IS_DIRTY(RS_DEPTH_CLAMP_ENABLE) || IS_DIRTY(RS_DEPTH_CLIP_ENABLE) ||
+        IS_DIRTY(RS_DEPTH_BIAS_ENABLE) || IS_DIRTY(RS_DEPTH_BIAS_FACTORS) ||
+        IS_DIRTY(VP_VIEWPORT_COUNT) || IS_DIRTY(VP_VIEWPORTS)))
+      kk_flush_polygon_points(cmd);
 
    if ((IS_DIRTY(DS_DEPTH_BOUNDS_TEST_ENABLE) ||
         IS_DIRTY(DS_DEPTH_BOUNDS_TEST_BOUNDS)) &&

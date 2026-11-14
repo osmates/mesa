@@ -105,6 +105,8 @@ struct kk_vs_key {
    bool is_points;
    /* Topology class, which picks the passthrough GS input */
    enum mesa_prim reduced_prim;
+   /* Triangles drawn as points add or change the GS */
+   VkPolygonMode polygon_mode;
    struct vk_vertex_input_state vi;
 };
 
@@ -117,6 +119,8 @@ kk_populate_vs_key(struct kk_vs_key *key,
       (state->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST);
    key->reduced_prim =
       u_reduced_prim(vk_topology_to_mesa(state->ia->primitive_topology));
+   key->polygon_mode =
+      state->rs ? state->rs->polygon_mode : VK_POLYGON_MODE_FILL;
    key->vi = *state->vi;
 }
 
@@ -358,6 +362,20 @@ kk_is_possible_both_depth_clip_clamp(
    return (dyn_clamp || static_clamp_match) && (dyn_clip || static_clip_match);
 }
 
+static bool
+kk_may_draw_polygon_points(const struct vk_graphics_pipeline_state *state)
+{
+   return state->rs && state->rs->polygon_mode == VK_POLYGON_MODE_POINT;
+}
+
+static bool
+kk_may_clamp_depth(const struct vk_graphics_pipeline_state *state)
+{
+   return !state->rs ||
+          BITSET_TEST(state->dynamic, MESA_VK_DYNAMIC_RS_DEPTH_CLAMP_ENABLE) ||
+          state->rs->depth_clamp_enable;
+}
+
 static void
 kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
                 const struct vk_pipeline_robustness_state *rs)
@@ -394,10 +412,11 @@ kk_lower_vs_vbo(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
    NIR_PASS(_, nir, kk_nir_lower_vbo, attributes, robustness2);
 }
 
-/* Lowering for the stage which ends up as the vertex stage on hardware */
+/* Lowering for the stage which ends up as the vertex stage on hardware.
+ * Triangles drawn as points already have their framebuffer depth. */
 static void
 kk_lower_hw_vs(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
-               bool is_point)
+               bool is_point, bool polygon_points)
 {
    if (is_point)
       NIR_PASS(_, nir, msl_ensure_vertex_point_size_output);
@@ -406,12 +425,15 @@ kk_lower_hw_vs(nir_shader *nir, const struct vk_graphics_pipeline_state *state,
                                  nir_metadata_control_flow, NULL);
 
    NIR_PASS(_, nir, msl_ensure_vertex_position_output);
-   NIR_PASS(_, nir, nir_lower_clip_halfz_dynamic);
 
-   /* In any situation where both clip and clamp can be disabled, we need to
-    * add viewport Z transform emulation to the shader */
-   if (kk_is_possible_both_depth_clip_clamp(state, false))
-      NIR_PASS(_, nir, msl_nir_lower_vs_disabled_depth_clamp_clip);
+   if (!polygon_points) {
+      NIR_PASS(_, nir, nir_lower_clip_halfz_dynamic);
+
+      /* In any situation where both clip and clamp can be disabled, we need
+       * to add viewport Z transform emulation to the shader */
+      if (kk_is_possible_both_depth_clip_clamp(state, false))
+         NIR_PASS(_, nir, msl_nir_lower_vs_disabled_depth_clamp_clip);
+   }
 
    NIR_PASS(_, nir, msl_nir_vs_io_types);
 }
@@ -541,8 +563,10 @@ kk_lower_fs(struct kk_device *dev, nir_shader *nir,
    }
 
    /* In any situation where both clip and clamp can be enabled, we need to
-    * add clamp emulation to the shader */
-   if (kk_is_possible_both_depth_clip_clamp(state, true))
+    * add clamp emulation to the shader. Triangles drawn as points need it
+    * whenever clamp can be enabled, as Metal clamps them to [0, 1]. */
+   if (kk_is_possible_both_depth_clip_clamp(state, true) ||
+       (kk_may_draw_polygon_points(state) && kk_may_clamp_depth(state)))
       NIR_PASS(_, nir, msl_nir_lower_fs_combined_depth_clamp_clip);
 
    /* Input attachments are treated as 2D textures. Fixes sampler dimension */
@@ -796,7 +820,7 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
          nir->info.stage == MESA_SHADER_TESS_EVAL
             ? nir->info.tess.point_mode
             : state->ia->primitive_topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
-      kk_lower_hw_vs(nir, state, is_point);
+      kk_lower_hw_vs(nir, state, is_point, false);
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       kk_lower_fs(dev, nir, state);
    }
@@ -904,6 +928,22 @@ gather_vs_inputs(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    struct nir_io_semantics io = nir_intrinsic_io_semantics(intr);
    BITSET_WORD *attribs_read = data;
    BITSET_SET(attribs_read, (io.location - VERT_ATTRIB_GENERIC0));
+   return false;
+}
+
+static bool
+fs_reads_primitive_id(const nir_shader *nir)
+{
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic ==
+                   nir_intrinsic_load_primitive_id)
+               return true;
+         }
+      }
+   }
    return false;
 }
 
@@ -1067,6 +1107,7 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
                   struct kk_shader *prev_stage,
                   const struct vk_pipeline_robustness_state *robustness,
                   const struct vk_graphics_pipeline_state *state,
+                  const struct poly_polygon_points *points,
                   const VkAllocationCallbacks *pAllocator,
                   struct kk_shader **shader_out, bool apply_wa19)
 {
@@ -1169,7 +1210,12 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
 
       nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
       NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs,
-               &shader->info.gs, NULL);
+               &shader->info.gs, points);
+
+      /* Triangles drawn as points were culled by their cull distances, the
+       * FS must not cull each point by its own */
+      if (shader->info.gs.polygon_points)
+         shader->info.num_cull_distances = 0;
 
       /* Keep these for XFB. KK doesn't expose pipeline statistics. */
       if (shader->info.gs.xfb) {
@@ -1198,7 +1244,8 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
        * localize them so msl_optimize_nir turns them into SSA */
       NIR_PASS(_, nir, nir_lower_global_vars_to_local);
 
-      kk_lower_hw_vs(nir, state, shader->info.gs.mode == MESA_PRIM_POINTS);
+      kk_lower_hw_vs(nir, state, shader->info.gs.mode == MESA_PRIM_POINTS,
+                     shader->info.gs.polygon_points);
       msl_nir_lower_clip_cull_distance(nir, 0);
       /* Descriptors were lowered with the GS, this lowers the system values
        * the hardware vertex lowering added */
@@ -1235,8 +1282,8 @@ kk_compile_nir_shader(struct kk_device *dev, nir_shader *nir,
 
    struct kk_shader *shader = NULL;
    nir_shader_gather_info(nir, nir_shader_get_entrypoint(nir));
-   VkResult result =
-      kk_compile_shader(dev, nir, NULL, &rs_none, NULL, alloc, &shader, false);
+   VkResult result = kk_compile_shader(dev, nir, NULL, &rs_none, NULL, NULL,
+                                       alloc, &shader, false);
    if (result != VK_SUCCESS)
       return result;
 
@@ -1777,12 +1824,28 @@ gather_output_type(nir_builder *b, nir_intrinsic_instr *intr, void *data)
    return false;
 }
 
-/* Add a passthrough GS so poly can capture the last stage's outputs.
- * prim is the point, line or triangle list it takes as input. */
-static nir_shader *
-kk_xfb_passthrough_gs(const nir_shader *last, enum mesa_prim prim)
+static bool
+store_primitive_id(nir_builder *b, nir_intrinsic_instr *intr, void *data)
 {
-   uint16_t xfb_outputs = last->xfb_info->output_count;
+   if (intr->intrinsic != nir_intrinsic_emit_vertex)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_store_output(b, nir_load_primitive_id(b), nir_imm_int(b, 0),
+                    .src_type = nir_type_uint32,
+                    .io_semantics.location = VARYING_SLOT_PRIMITIVE_ID);
+   return true;
+}
+
+/* Add a passthrough GS so poly can capture the last stage's outputs, or draw
+ * its triangles as points. prim is the point, line or triangle list it takes
+ * as input. Points write the primitive ID a FS reads, which Metal numbers by
+ * point. */
+static nir_shader *
+kk_passthrough_gs(const nir_shader *last, enum mesa_prim prim,
+                  bool write_primitive_id)
+{
+   uint16_t xfb_outputs = last->xfb_info ? last->xfb_info->output_count : 0;
    struct poly_passthrough_gs_key *key =
       calloc(1, poly_passthrough_gs_key_size(xfb_outputs));
 
@@ -1811,16 +1874,24 @@ kk_xfb_passthrough_gs(const nir_shader *last, enum mesa_prim prim)
    nir_shader_intrinsics_pass((nir_shader *)last, gather_output_type,
                               nir_metadata_all, key->output_types);
 
-   memcpy(key->xfb_stride, last->info.xfb_stride, sizeof(key->xfb_stride));
-   memcpy(&key->xfb_info, last->xfb_info, nir_xfb_info_size(xfb_outputs));
+   if (last->xfb_info) {
+      memcpy(key->xfb_stride, last->info.xfb_stride, sizeof(key->xfb_stride));
+      memcpy(&key->xfb_info, last->xfb_info, nir_xfb_info_size(xfb_outputs));
+   }
 
-   nir_builder b = nir_builder_init_simple_shader(
-      MESA_SHADER_GEOMETRY, last->options, "xfb passthrough");
+   nir_builder b = nir_builder_init_simple_shader(MESA_SHADER_GEOMETRY,
+                                                  last->options, "passthrough");
    poly_nir_passthrough_gs(&b, key);
    free(key);
 
    nir_shader *gs = b.shader;
+   if (write_primitive_id) {
+      nir_shader_intrinsics_pass(gs, store_primitive_id,
+                                 nir_metadata_control_flow, NULL);
+   }
+
    gs->info.io_lowered = true;
+   gs->info.prev_stage = last->info.stage;
    gs->info.next_stage = MESA_SHADER_FRAGMENT;
    nir_shader_gather_info(gs, b.impl);
    return gs;
@@ -1848,7 +1919,7 @@ rewrite_adjacency_vertex(nir_builder *b, nir_intrinsic_instr *intr, void *data)
  * from the linked list variant so both read the same inputs. Its input
  * assembly handles strips, as for an application GS. */
 static nir_shader *
-kk_xfb_passthrough_gs_adjacency(const nir_shader *gs)
+kk_passthrough_gs_adjacency(const nir_shader *gs)
 {
    enum mesa_prim prim = gs->info.gs.input_primitive == MESA_PRIM_LINES
                             ? MESA_PRIM_LINES_ADJACENCY
@@ -1877,13 +1948,14 @@ static void
 kk_compile_gs_adjacency(struct kk_physical_device *pdev, nir_shader *nir,
                         const struct vk_pipeline_robustness_state *robustness,
                         const struct vk_graphics_pipeline_state *state,
+                        const struct poly_polygon_points *points,
                         struct kk_shader *shader)
 {
    NIR_PASS(_, nir, nir_lower_io_to_scalar, nir_var_shader_in, NULL, NULL);
 
    struct poly_gs_info info;
    nir_shader *count = NULL, *rast = NULL, *pre_gs = NULL;
-   NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs, &info, NULL);
+   NIR_PASS(_, nir, poly_nir_lower_gs, &count, &rast, &pre_gs, &info, points);
    ralloc_free(count);
    ralloc_free(pre_gs);
 
@@ -1892,16 +1964,121 @@ kk_compile_gs_adjacency(struct kk_physical_device *pdev, nir_shader *nir,
           info.max_indices == shader->info.gs.max_indices &&
           info.count_words == shader->info.gs.count_words &&
           info.xfb == shader->info.gs.xfb &&
-          info.prefix_sum == shader->info.gs.prefix_sum);
+          info.prefix_sum == shader->info.gs.prefix_sum &&
+          info.polygon_points == shader->info.gs.polygon_points);
 
    ralloc_free(nir);
 
    /* As for the GS in kk_compile_shader */
    NIR_PASS(_, rast, nir_lower_global_vars_to_local);
-   kk_lower_hw_vs(rast, state, info.mode == MESA_PRIM_POINTS);
+   kk_lower_hw_vs(rast, state, info.mode == MESA_PRIM_POINTS,
+                  info.polygon_points);
    msl_nir_lower_clip_cull_distance(rast, 0);
    NIR_PASS(_, rast, kk_nir_lower_descriptors, robustness, 0, NULL);
    kk_compile_msl(pdev, rast, state, &shader->gs_rast_adjacency, false);
+}
+
+/* The class of primitives the last pre-rasterization stage outputs */
+static enum mesa_prim
+kk_last_vtg_prim(const struct vk_graphics_pipeline_state *state,
+                 const struct vk_shader_compile_info *infos, uint32_t last_vtg)
+{
+   const nir_shader *nir = infos[last_vtg].nir;
+
+   switch (nir->info.stage) {
+   case MESA_SHADER_GEOMETRY:
+      return u_reduced_prim(nir->info.gs.output_primitive);
+
+   case MESA_SHADER_TESS_EVAL: {
+      /* The TCS may supply the primitive mode or point mode. */
+      const nir_shader *tcs = infos[last_vtg - 1u].nir;
+      enum tess_primitive_mode mode =
+         nir->info.tess._primitive_mode ?: tcs->info.tess._primitive_mode;
+      if (nir->info.tess.point_mode || tcs->info.tess.point_mode)
+         return MESA_PRIM_POINTS;
+      else if (mode == TESS_PRIMITIVE_ISOLINES)
+         return MESA_PRIM_LINES;
+      else
+         return MESA_PRIM_TRIANGLES;
+   }
+
+   default:
+      /* The topology is dynamic within its class. */
+      return u_reduced_prim(vk_topology_to_mesa(state->ia->primitive_topology));
+   }
+}
+
+static bool
+gather_fs_interpolation(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   struct poly_polygon_points *key = data;
+   uint64_t *mask;
+
+   if (intr->intrinsic == nir_intrinsic_load_input) {
+      mask = &key->flat_outputs;
+   } else if (intr->intrinsic == nir_intrinsic_load_interpolated_input &&
+              nir_intrinsic_interp_mode(nir_src_as_intrinsic(intr->src[0])) ==
+                 INTERP_MODE_NOPERSPECTIVE) {
+      mask = &key->noperspective_outputs;
+   } else {
+      return false;
+   }
+
+   nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   for (unsigned i = 0; i < sem.num_slots; ++i) {
+      if (sem.location + i < 64)
+         *mask |= BITFIELD64_BIT(sem.location + i);
+   }
+
+   return false;
+}
+
+static bool
+load_facing_input(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+{
+   const unsigned *slot = data;
+   if (intr->intrinsic != nir_intrinsic_load_front_face)
+      return false;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *facing =
+      nir_load_input(b, 1, 32, nir_imm_int(b, 0), .dest_type = nir_type_uint32,
+                     .io_semantics.location = *slot);
+   nir_def_replace(&intr->def, nir_ine_imm(b, facing, 0));
+   return true;
+}
+
+/* What drawing the GS's triangles as points needs from the FS: how it
+ * interpolates its inputs, and the polygon's facing, as Metal points are
+ * always front facing. The facing goes in a slot neither shader uses. */
+static void
+kk_polygon_points_key(nir_shader *gs, nir_shader *fs,
+                      struct poly_polygon_points *key)
+{
+   assert(gs->info.stage == MESA_SHADER_GEOMETRY &&
+          fs->info.stage == MESA_SHADER_FRAGMENT);
+   memset(key, 0, sizeof(*key));
+
+   nir_shader_intrinsics_pass(fs, gather_fs_interpolation, nir_metadata_all,
+                              key);
+
+   nir_shader_gather_info(gs, nir_shader_get_entrypoint(gs));
+   nir_shader_gather_info(fs, nir_shader_get_entrypoint(fs));
+
+   uint64_t used = gs->info.outputs_written | fs->info.inputs_read;
+   unsigned slot = VARYING_SLOT_VAR31;
+   while (slot >= VARYING_SLOT_VAR0 && (used & BITFIELD64_BIT(slot)))
+      --slot;
+
+   if (slot < VARYING_SLOT_VAR0)
+      return;
+
+   if (nir_shader_intrinsics_pass(fs, load_facing_input,
+                                  nir_metadata_control_flow, &slot)) {
+      BITSET_CLEAR(fs->info.system_values_read, SYSTEM_VALUE_FRONT_FACE);
+      fs->info.inputs_read |= BITFIELD64_BIT(slot);
+      key->facing_slot = slot;
+   }
 }
 
 static VkResult
@@ -1923,8 +2100,8 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
    struct kk_shader *shaders[shader_count + 2u];
    bool generated[shader_count + 2u];
 
-   /* Capture the last pre-rasterization stage, adding a passthrough GS if
-    * the application doesn't have one. */
+   /* Capture the last pre-rasterization stage, or draw its triangles as
+    * points, adding a passthrough GS if the application doesn't have one. */
    uint32_t last_vtg = 0u;
    for (uint32_t i = 0u; i < shader_count; ++i) {
       if (infos[i].stage == MESA_SHADER_VERTEX ||
@@ -1932,8 +2109,16 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
           infos[i].stage == MESA_SHADER_GEOMETRY)
          last_vtg = i;
    }
-   bool xfb_gs = state && infos[last_vtg].nir->xfb_info &&
-                 infos[last_vtg].stage != MESA_SHADER_GEOMETRY;
+   bool polygon_points =
+      state && kk_may_draw_polygon_points(state) &&
+      kk_last_vtg_prim(state, infos, last_vtg) == MESA_PRIM_TRIANGLES;
+   bool passthrough_gs = state &&
+                         infos[last_vtg].stage != MESA_SHADER_GEOMETRY &&
+                         (infos[last_vtg].nir->xfb_info || polygon_points);
+   const nir_shader *fs_nir =
+      infos[shader_count - 1u].stage == MESA_SHADER_FRAGMENT
+         ? infos[shader_count - 1u].nir
+         : NULL;
 
    /* Lower shaders, notably lowering IO. This is a prerequisite for intershader
     * optimization. */
@@ -1947,7 +2132,7 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
       bool emulated_stage =
          (info->next_stage_mask & (VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT |
                                    VK_SHADER_STAGE_GEOMETRY_BIT)) ||
-         (xfb_gs && i == last_vtg);
+         (passthrough_gs && i == last_vtg);
 
       msl_preprocess_nir_workarounds(nir, pdev->settings.disabled_workarounds);
       kk_lower_nir(dev, nir, emulated_stage, info->robustness,
@@ -1965,30 +2150,18 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
       generated[total_shaders] = false;
       nir_shaders[total_shaders++] = nir;
 
-      if (xfb_gs && i == last_vtg) {
-         enum mesa_prim prim;
-         if (nir->info.stage == MESA_SHADER_TESS_EVAL) {
-            /* The TCS may supply the primitive mode or point mode. */
-            const nir_shader *tcs = nir_shaders[total_shaders - 2u];
-            enum tess_primitive_mode mode =
-               nir->info.tess._primitive_mode ?: tcs->info.tess._primitive_mode;
-            if (nir->info.tess.point_mode || tcs->info.tess.point_mode)
-               prim = MESA_PRIM_POINTS;
-            else if (mode == TESS_PRIMITIVE_ISOLINES)
-               prim = MESA_PRIM_LINES;
-            else
-               prim = MESA_PRIM_TRIANGLES;
-         } else {
-            /* The topology is dynamic within its class. This variant takes
-             * the class's list or strip; a second one takes its adjacency
-             * topologies. */
-            prim = u_reduced_prim(
-               vk_topology_to_mesa(state->ia->primitive_topology));
-         }
+      if (passthrough_gs && i == last_vtg) {
+         /* A VS's variant takes the class's list or strip; a second one
+          * takes its adjacency topologies. */
+         enum mesa_prim prim = kk_last_vtg_prim(state, infos, last_vtg);
+         bool primitive_id =
+            polygon_points && fs_nir && fs_reads_primitive_id(fs_nir);
 
-         nir_shader *gs = kk_xfb_passthrough_gs(nir, prim);
-         NIR_PASS(_, gs, nir_opt_constant_folding);
-         NIR_PASS(_, gs, nir_io_add_intrinsic_xfb_info);
+         nir_shader *gs = kk_passthrough_gs(nir, prim, primitive_id);
+         if (gs->xfb_info) {
+            NIR_PASS(_, gs, nir_opt_constant_folding);
+            NIR_PASS(_, gs, nir_io_add_intrinsic_xfb_info);
+         }
          nir->info.next_stage = MESA_SHADER_GEOMETRY;
 
          generated[total_shaders] = true;
@@ -2025,6 +2198,14 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
    nir_opt_varyings_bulk(nir_shaders, total_shaders, true, UINT32_MAX,
                          UINT32_MAX, nir_opts, NULL);
 
+   struct poly_polygon_points points_key;
+   const struct poly_polygon_points *points = NULL;
+   if (polygon_points) {
+      kk_polygon_points_key(nir_shaders[total_shaders - 2u],
+                            nir_shaders[total_shaders - 1u], &points_key);
+      points = &points_key;
+   }
+
    for (uint32_t i = 0; i < total_shaders; i++) {
       struct kk_shader *prev_stage = i > 0 ? shaders[i - 1] : NULL;
       nir_shader *nir = nir_shaders[i];
@@ -2035,14 +2216,17 @@ kk_compile_shaders(struct vk_device *device, uint32_t shader_count,
       if (generated[i] && nir->info.stage == MESA_SHADER_GEOMETRY &&
           infos[last_vtg].stage == MESA_SHADER_VERTEX &&
           nir->info.gs.input_primitive != MESA_PRIM_POINTS)
-         adjacency = kk_xfb_passthrough_gs_adjacency(nir);
+         adjacency = kk_passthrough_gs_adjacency(nir);
 
-      result = kk_compile_shader(dev, nir, prev_stage, vertex_robustness,
-                                 state, pAllocator, &shaders[i], apply_wa19);
+      const struct poly_polygon_points *gs_points =
+         nir->info.stage == MESA_SHADER_GEOMETRY ? points : NULL;
+      result =
+         kk_compile_shader(dev, nir, prev_stage, vertex_robustness, state,
+                           gs_points, pAllocator, &shaders[i], apply_wa19);
 
       if (result == VK_SUCCESS && adjacency) {
          kk_compile_gs_adjacency(pdev, adjacency, vertex_robustness, state,
-                                 shaders[i]);
+                                 gs_points, shaders[i]);
       }
 
       if (result != VK_SUCCESS) {

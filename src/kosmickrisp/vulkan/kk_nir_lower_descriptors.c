@@ -446,6 +446,25 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
       return true;
    }
 
+   case nir_intrinsic_load_rasterizer_state_poly:
+      return lower_sysval_to_root_table(b, intrin, draw.rasterizer_state);
+
+   case nir_intrinsic_load_depth_bias_poly:
+      return lower_sysval_to_root_table(b, intrin, draw.depth_bias);
+
+   case nir_intrinsic_load_viewport_transform_poly: {
+      unsigned offset = kk_root_descriptor_offset(draw.viewport_transform);
+      assert((offset & 3) == 0 && "aligned");
+      b->cursor = nir_instr_remove(&intrin->instr);
+      nir_def *index =
+         nir_umin(b, intrin->src[0].ssa, nir_imm_int(b, KK_MAX_VIEWPORTS - 1));
+      nir_def *vp_offset = nir_imul_imm(b, index, sizeof(float) * 4u);
+      nir_def *root_offset = nir_iadd_imm(b, vp_offset, offset);
+      nir_def *val = load_root(b, 4, 32, root_offset, 4);
+      nir_def_rewrite_uses(&intrin->def, val);
+      return true;
+   }
+
    case nir_intrinsic_load_push_constant:
       return lower_load_push_constant(b, intrin, ctx);
 

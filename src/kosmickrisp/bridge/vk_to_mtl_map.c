@@ -264,6 +264,9 @@ vk_polygon_mode_to_mtl_triangle_fill_mode(enum VkPolygonMode mode)
       return MTL_TRIANGLE_FILL_MODE_FILL;
    case VK_POLYGON_MODE_LINE:
       return MTL_TRIANGLE_FILL_MODE_LINES;
+   case VK_POLYGON_MODE_POINT:
+      /* A GS draws the triangles as points */
+      return MTL_TRIANGLE_FILL_MODE_FILL;
    default:
       UNREACHABLE("Unsupported VkPolygonMode");
    }

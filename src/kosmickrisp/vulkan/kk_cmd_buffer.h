@@ -43,6 +43,12 @@ struct kk_root_descriptor_table {
          float viewport_z_range[KK_MAX_VIEWPORTS * 2];
          bool emulate_depth_clamp;
          bool emulate_viewport_z;
+
+         /* Triangles drawn as points: poly_rasterizer_state, depth bias and
+          * each viewport's x, y and z scales and z offset */
+         uint32_t rasterizer_state;
+         float depth_bias[4];
+         float viewport_transform[KK_MAX_VIEWPORTS * 4];
       } draw;
       struct {
          uint32_t base_group[3];
@@ -156,6 +162,8 @@ struct kk_graphics_state {
    bool is_depth_stencil_dynamic;
    bool is_cull_front_and_back;
    bool need_to_start_render_pass;
+   /* Whether the flushed state is that of triangles drawn as points */
+   bool polygon_points;
 
    enum kk_dirty dirty;
    uint32_t pipeline_sample_count;
