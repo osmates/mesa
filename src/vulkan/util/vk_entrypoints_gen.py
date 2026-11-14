@@ -65,6 +65,17 @@ extern "C" {
 #define VK_ENTRY_WEAK
 #endif
 
+/* ARM64EC with clang: a function's code symbol is its name prefixed with
+ * '#', and the plain name is only a weak alias of it, which loses to the
+ * weak reference's NULL fallback. So the weak reference names the code
+ * symbol, which is the function's address on ARM64EC.
+ */
+#if !defined(_MSC_VER) && defined(VK_ENTRY_USE_WEAK) && defined(__arm64ec__)
+#define VK_ENTRY_EC_NAME(name) __asm__("#" #name)
+#else
+#define VK_ENTRY_EC_NAME(name)
+#endif
+
 /* On Unix, we explicitly declare the symbols as hidden, as -fvisibility=hidden
  * only applies to definitions, not declarations.
  * Windows uses hidden visibility by default (requiring dllexport for public
@@ -98,7 +109,7 @@ extern const struct vk_device_entrypoint_table ${tmpl_prefix}_device_entrypoints
 #ifdef ${e.guard}
   % endif
   % for p in physical_device_prefixes:
-  VKAPI_ATTR ${e.return_type} VKAPI_CALL ${p}_${e.name}(${e.decl_params()}) VK_ENTRY_WEAK VK_ENTRY_HIDDEN;
+  VKAPI_ATTR ${e.return_type} VKAPI_CALL ${p}_${e.name}(${e.decl_params()}) VK_ENTRY_EC_NAME(${p}_${e.name}) VK_ENTRY_WEAK VK_ENTRY_HIDDEN;
   % endfor
   % if e.guard is not None:
 #endif // ${e.guard}
@@ -110,7 +121,7 @@ extern const struct vk_device_entrypoint_table ${tmpl_prefix}_device_entrypoints
 #ifdef ${e.guard}
   % endif
   % for p in physical_device_prefixes:
-  VKAPI_ATTR ${e.return_type} VKAPI_CALL ${p}_${e.name}(${e.decl_params()}) VK_ENTRY_WEAK VK_ENTRY_HIDDEN;
+  VKAPI_ATTR ${e.return_type} VKAPI_CALL ${p}_${e.name}(${e.decl_params()}) VK_ENTRY_EC_NAME(${p}_${e.name}) VK_ENTRY_WEAK VK_ENTRY_HIDDEN;
   % endfor
   % if e.guard is not None:
 #endif // ${e.guard}
@@ -122,7 +133,7 @@ extern const struct vk_device_entrypoint_table ${tmpl_prefix}_device_entrypoints
 #ifdef ${e.guard}
   % endif
   % for p in device_prefixes:
-  VKAPI_ATTR ${e.return_type} VKAPI_CALL ${p}_${e.name}(${e.decl_params()}) VK_ENTRY_WEAK VK_ENTRY_HIDDEN;
+  VKAPI_ATTR ${e.return_type} VKAPI_CALL ${p}_${e.name}(${e.decl_params()}) VK_ENTRY_EC_NAME(${p}_${e.name}) VK_ENTRY_WEAK VK_ENTRY_HIDDEN;
   % endfor
 
   % if tmpl_prefix:
