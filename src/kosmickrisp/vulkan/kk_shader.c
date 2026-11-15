@@ -172,6 +172,7 @@ enum kk_feature_key {
    KK_FEAT_CUSTOM_BORDER = BITFIELD_BIT(0),
    KK_FEAT_NULL_DESCRIPTOR = BITFIELD_BIT(1),
    KK_FEAT_IMAGE_VIEW_MIN_LOD_EMULATED = BITFIELD_BIT(2),
+   KK_FEAT_SAMPLER_MINMAX = BITFIELD_BIT(3),
 };
 
 static enum kk_feature_key
@@ -186,6 +187,8 @@ kk_make_feature_key(const struct vk_features *feats,
    /* Emulated in shader on M5 and below */
    if (feats->minLod && pdev->info.gpu_apple_family < 11)
       key |= KK_FEAT_IMAGE_VIEW_MIN_LOD_EMULATED;
+   if (feats->samplerFilterMinmax)
+      key |= KK_FEAT_SAMPLER_MINMAX;
    return key;
 }
 
@@ -796,6 +799,11 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
    } else if (nir->info.stage == MESA_SHADER_FRAGMENT) {
       kk_lower_fs(dev, nir, state);
    }
+
+   /* Before the custom border pass, which wraps each texel read */
+   if (features & KK_FEAT_SAMPLER_MINMAX)
+      NIR_PASS(_, nir, kk_nir_lower_sampler_minmax, set_layout_count,
+               set_layouts, features & KK_FEAT_IMAGE_VIEW_MIN_LOD_EMULATED);
 
    if (features & KK_FEAT_CUSTOM_BORDER)
       NIR_PASS(_, nir, kk_nir_lower_custom_border);

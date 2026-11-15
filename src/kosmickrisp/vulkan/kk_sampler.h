@@ -32,6 +32,13 @@ struct kk_sampler {
    struct {
       struct kk_rc_sampler *hw;
    } planes[2];
+
+   /* KK_REDUCTION_* when the shader emulates min/max reduction */
+   uint16_t reduction;
+   uint16_t reduction_lod_bias_fp16;
+
+   /* Nearest samplers for the emulation, clamp=0 only with a custom border */
+   struct kk_rc_sampler *reduction_hw[2];
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_sampler, vk.base, VkSampler,
