@@ -295,6 +295,10 @@ kk_CreateDevice(VkPhysicalDevice physicalDevice,
    dev->vk.command_dispatch_table = &dev->vk.dispatch_table;
    dev->vk.get_timestamp = kk_get_timestamp;
 
+   /* The extension aliases the feature, and shaders key on the feature */
+   if (dev->vk.enabled_extensions.EXT_sampler_filter_minmax)
+      dev->vk.enabled_features.samplerFilterMinmax = true;
+
    /* Create a new Metal pipeline compiler for the device */
    dev->mtl_compiler_handle = kk_acquire_compiler(dev);
    if (dev->mtl_compiler_handle == NULL)

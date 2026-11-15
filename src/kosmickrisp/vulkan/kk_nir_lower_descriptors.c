@@ -603,6 +603,17 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       return true;
    }
 
+   if (tex->op == nir_texop_sampler_reduction_kk) {
+      unsigned offs = offsetof(struct kk_sampled_image_descriptor, reduction);
+
+      nir_def *res = load_resource_deref_desc(
+         b, 4, 16, nir_src_as_deref(nir_src_for_ssa(sampler)),
+         plane_offset_B + offs, ctx);
+
+      nir_def_replace(&tex->def, res);
+      return true;
+   }
+
    if (tex->op == nir_texop_custom_border_color_agx) {
       unsigned offs = offsetof(struct kk_sampled_image_descriptor, border);
 
@@ -643,9 +654,16 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
          offsetof(struct kk_sampled_image_descriptor, sampler_index);
 
       bool clamp_to_0 = tex->backend_flags & KK_TEXTURE_FLAG_CLAMP_TO_0;
-      if (clamp_to_0)
+      if (tex->backend_flags & KK_TEXTURE_FLAG_REDUCTION_TAP) {
+         offs = clamp_to_0
+                   ? offsetof(struct kk_sampled_image_descriptor,
+                              reduction_clamp_0_sampler_index_or_negative)
+                   : offsetof(struct kk_sampled_image_descriptor,
+                              reduction_sampler_index);
+      } else if (clamp_to_0) {
          offs = offsetof(struct kk_sampled_image_descriptor,
                          clamp_0_sampler_index_or_negative);
+      }
 
       nir_def *index = load_resource_deref_desc(
          b, 1, 16, nir_src_as_deref(nir_src_for_ssa(sampler)),

@@ -7,6 +7,7 @@
 
 #include "kk_sampler.h"
 
+#include "kk_descriptor_types.h"
 #include "kk_entrypoints.h"
 #include "kk_physical_device.h"
 
@@ -37,6 +38,29 @@ is_border_color_custom(VkBorderColor color)
    return color == VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK ||
           color == VK_BORDER_COLOR_INT_CUSTOM_EXT ||
           color == VK_BORDER_COLOR_FLOAT_CUSTOM_EXT;
+}
+
+static VkSamplerReductionMode
+get_reduction_mode(const VkSamplerCreateInfo *info)
+{
+   const VkSamplerReductionModeCreateInfo *reduction_info =
+      vk_find_struct_const(info->pNext, SAMPLER_REDUCTION_MODE_CREATE_INFO);
+   return reduction_info ? reduction_info->reductionMode
+                         : VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
+}
+
+/* Metal honours reductionMode only from Apple10 and with linear min, mag and
+ * mip filters, so the shader emulates it otherwise.
+ */
+static bool
+is_reduction_native(const struct kk_physical_device *pdev,
+                    const VkSamplerCreateInfo *info)
+{
+   return pdev->info.gpu_apple_family >= 10 &&
+          info->magFilter == VK_FILTER_LINEAR &&
+          info->minFilter == VK_FILTER_LINEAR &&
+          info->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR &&
+          !info->unnormalizedCoordinates;
 }
 
 static struct mtl_sampler_packed
@@ -78,16 +102,10 @@ pack_sampler_info(const struct kk_physical_device *pdev,
       pdev->info.gpu_apple_family >= 10 ? sampler_info->mipLodBias : 0.0f;
 
    enum mtl_sampler_reduction_mode reduction_mode =
-      MTL_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
-   if (pdev->vk.supported_extensions.EXT_sampler_filter_minmax) {
-      const VkSamplerReductionModeCreateInfo *reduction_info =
-         vk_find_struct_const(sampler_info->pNext,
-                              SAMPLER_REDUCTION_MODE_CREATE_INFO);
-      if (reduction_info)
-         reduction_mode =
-            vk_sampler_reduction_mode_to_mtl_sampler_reduction_mode(
-               reduction_info->reductionMode);
-   }
+      is_reduction_native(pdev, sampler_info)
+         ? vk_sampler_reduction_mode_to_mtl_sampler_reduction_mode(
+              get_reduction_mode(sampler_info))
+         : MTL_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
 
    return (struct mtl_sampler_packed){
       .mode_u = vk_sampler_address_mode_to_mtl_sampler_address_mode(
@@ -136,7 +154,7 @@ create_sampler_descriptor(const struct kk_device *dev,
    if (pdev->info.gpu_apple_family >= 10)
       mtl_sampler_descriptor_set_lod_bias(descriptor, packed->lod_bias);
 
-   if (pdev->vk.supported_extensions.EXT_sampler_filter_minmax)
+   if (pdev->info.gpu_apple_family >= 10)
       mtl_sampler_descriptor_set_reduction_mode(descriptor,
                                                 packed->reduction_mode);
 
@@ -151,6 +169,34 @@ kk_sampler_create(struct kk_device *dev,
    mtl_sampler *sampler = mtl_new_sampler(dev->mtl_handle, desc);
    mtl_release(desc);
    return sampler;
+}
+
+/* The shader reads single texels at the texel centres of the filter footprint
+ * through these, so Metal still applies the address modes and borders.
+ */
+static VkResult
+add_reduction_samplers(struct kk_device *dev, struct kk_sampler *sampler,
+                       const struct mtl_sampler_packed *base,
+                       bool custom_border)
+{
+   struct mtl_sampler_packed nearest = *base;
+   nearest.min_filter = MTL_SAMPLER_MIN_MAG_FILTER_NEAREST;
+   nearest.mag_filter = MTL_SAMPLER_MIN_MAG_FILTER_NEAREST;
+   if (nearest.mip_filter != MTL_SAMPLER_MIP_FILTER_NOT_MIP_MAPPED)
+      nearest.mip_filter = MTL_SAMPLER_MIP_FILTER_NEAREST;
+   nearest.reduction_mode = MTL_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
+   nearest.lod_bias = 0.0f;
+   nearest.min_lod = 0.0f;
+   nearest.max_lod = VK_LOD_CLAMP_NONE;
+   nearest.max_anisotropy = 1u;
+
+   VkResult result =
+      kk_sampler_heap_add(dev, nearest, &sampler->reduction_hw[0]);
+   if (result != VK_SUCCESS || !custom_border)
+      return result;
+
+   nearest.border_color = MTL_SAMPLER_BORDER_COLOR_TRANSPARENT_BLACK;
+   return kk_sampler_heap_add(dev, nearest, &sampler->reduction_hw[1]);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL
@@ -171,8 +217,9 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
                         uses_border(pCreateInfo) &&
                         is_border_color_custom(pCreateInfo->borderColor);
 
-   struct mtl_sampler_packed packed =
+   const struct mtl_sampler_packed base =
       pack_sampler_info(pdev, pCreateInfo, custom_border);
+   struct mtl_sampler_packed packed = base;
    result = kk_sampler_heap_add(dev, packed, &sampler->planes[0].hw);
    if (result != VK_SUCCESS) {
       kk_DestroySampler(device, kk_sampler_to_handle(sampler), pAllocator);
@@ -243,6 +290,35 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
       sampler->has_border = true;
    }
 
+   VkSamplerReductionMode reduction_mode = get_reduction_mode(pCreateInfo);
+   if (reduction_mode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE &&
+       !is_reduction_native(pdev, pCreateInfo)) {
+      result = add_reduction_samplers(dev, sampler, &base, custom_border);
+      if (result != VK_SUCCESS) {
+         kk_DestroySampler(device, kk_sampler_to_handle(sampler), pAllocator);
+         return result;
+      }
+
+      sampler->reduction = reduction_mode == VK_SAMPLER_REDUCTION_MODE_MIN
+                              ? KK_REDUCTION_MODE_MIN
+                              : KK_REDUCTION_MODE_MAX;
+      if (pCreateInfo->magFilter == VK_FILTER_LINEAR)
+         sampler->reduction |= KK_REDUCTION_MAG_LINEAR;
+      if (pCreateInfo->minFilter == VK_FILTER_LINEAR)
+         sampler->reduction |= KK_REDUCTION_MIN_LINEAR;
+      if (pCreateInfo->mipmapMode == VK_SAMPLER_MIPMAP_MODE_LINEAR &&
+          !pCreateInfo->unnormalizedCoordinates)
+         sampler->reduction |= KK_REDUCTION_MIP_LINEAR;
+      if (pCreateInfo->unnormalizedCoordinates)
+         sampler->reduction |= KK_REDUCTION_UNNORMALIZED;
+
+      /* Below Apple10 the shader already adds the bias, see lod_bias_fp16 */
+      sampler->reduction_lod_bias_fp16 =
+         pdev->info.gpu_apple_family >= 10
+            ? _mesa_float_to_half(pCreateInfo->mipLodBias)
+            : 0;
+   }
+
    /* LOD data passed in the descriptor set */
    sampler->lod_min_fp16 = _mesa_float_to_half(pCreateInfo->minLod);
    sampler->lod_max_fp16 = _mesa_float_to_half(pCreateInfo->maxLod);
@@ -270,6 +346,11 @@ kk_DestroySampler(VkDevice device, VkSampler _sampler,
 
    for (uint8_t plane = 0; plane < sampler->plane_count; plane++)
       kk_sampler_heap_remove(dev, sampler->planes[plane].hw);
+
+   for (uint8_t i = 0; i < ARRAY_SIZE(sampler->reduction_hw); i++) {
+      if (sampler->reduction_hw[i])
+         kk_sampler_heap_remove(dev, sampler->reduction_hw[i]);
+   }
 
    vk_sampler_destroy(&dev->vk, pAllocator, &sampler->vk);
 }

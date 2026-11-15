@@ -104,6 +104,12 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
          desc[plane].sampler_lod_min_fp16 = sampler->lod_min_fp16;
          desc[plane].sampler_lod_max_fp16 = sampler->lod_max_fp16;
          desc[plane].clamp_0_sampler_index_or_negative = -1;
+         desc[plane].reduction = sampler->reduction;
+         desc[plane].reduction_lod_bias_fp16 = sampler->reduction_lod_bias_fp16;
+         desc[plane].reduction_sampler_index =
+            sampler->reduction_hw[0] ? sampler->reduction_hw[0]->index : 0;
+         desc[plane].reduction_clamp_0_sampler_index_or_negative =
+            sampler->reduction_hw[1] ? sampler->reduction_hw[1]->index : -1;
       }
 
       if (sampler->has_border) {

@@ -36,6 +36,9 @@ lower_min_lod(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
    if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF)
       return false;
 
+   if (tex->backend_flags & KK_TEXTURE_FLAG_REDUCTION_TAP)
+      return false;
+
    bool oob_zero = tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms ||
                    tex->op == nir_texop_tg4;
 

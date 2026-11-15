@@ -207,6 +207,15 @@ bool kk_nir_lower_fs_multiview(nir_shader *nir, uint32_t view_mask);
 /* Indicates that the sampler should be overridden to clamp to 0 instead of 1 */
 #define KK_TEXTURE_FLAG_CLAMP_TO_0 (1 << 0)
 
+/* A single texel read for the min/max emulation, through its nearest sampler
+ * at an explicit level that already includes the image view's min LOD
+ */
+#define KK_TEXTURE_FLAG_REDUCTION_TAP (1 << 1)
+
+bool
+kk_nir_lower_sampler_minmax(nir_shader *nir, uint32_t set_layout_count,
+                            struct vk_descriptor_set_layout *const *set_layouts,
+                            bool view_min_lod);
 bool kk_nir_lower_custom_border(nir_shader *nir);
 bool kk_nir_lower_image_view_min_lod(nir_shader *nir);
 
