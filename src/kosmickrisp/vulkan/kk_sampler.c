@@ -290,6 +290,19 @@ kk_CreateSampler(VkDevice device, const VkSamplerCreateInfo *pCreateInfo,
       sampler->has_border = true;
    }
 
+   if (dev->vk.enabled_features.shaderResourceResidency &&
+       !sampler->vk.ycbcr_conversion) {
+      struct mtl_sampler_packed residency = base;
+      residency.border_color = MTL_SAMPLER_BORDER_COLOR_OPAQUE_WHITE;
+      residency.compare_func = MTL_COMPARE_FUNCTION_ALWAYS;
+      residency.reduction_mode = MTL_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
+      result = kk_sampler_heap_add(dev, residency, &sampler->residency_hw);
+      if (result != VK_SUCCESS) {
+         kk_DestroySampler(device, kk_sampler_to_handle(sampler), pAllocator);
+         return result;
+      }
+   }
+
    VkSamplerReductionMode reduction_mode = get_reduction_mode(pCreateInfo);
    if (reduction_mode != VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE &&
        !is_reduction_native(pdev, pCreateInfo)) {
@@ -351,6 +364,9 @@ kk_DestroySampler(VkDevice device, VkSampler _sampler,
       if (sampler->reduction_hw[i])
          kk_sampler_heap_remove(dev, sampler->reduction_hw[i]);
    }
+
+   if (sampler->residency_hw)
+      kk_sampler_heap_remove(dev, sampler->residency_hw);
 
    vk_sampler_destroy(&dev->vk, pAllocator, &sampler->vk);
 }

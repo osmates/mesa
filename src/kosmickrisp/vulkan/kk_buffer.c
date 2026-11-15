@@ -47,10 +47,16 @@ kk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
 
    /* A sparse buffer is a placement sparse buffer from the start. Its address
-    * holds before any bind, and vkQueueBindSparse maps heap tiles into it. */
+    * holds before any bind, and vkQueueBindSparse maps heap tiles into it. A
+    * residency mirror takes tiles past the buffer's. */
    if (kk_buffer_is_sparse(buffer)) {
+      const uint64_t mirror_tile = kk_sparse_buffer_mirror_tile(dev, buffer);
+      const uint64_t tiles =
+         DIV_ROUND_UP(buffer->vk.size, KK_SPARSE_PAGE_SIZE_B);
+      const uint64_t mtl_tiles =
+         mirror_tile != 0u ? mirror_tile + tiles : tiles;
       buffer->metal.handle = mtl_new_placement_sparse_buffer(
-         dev->mtl_handle, align64(buffer->vk.size, KK_SPARSE_PAGE_SIZE_B));
+         dev->mtl_handle, mtl_tiles * KK_SPARSE_PAGE_SIZE_B);
       if (buffer->metal.handle == NULL) {
          vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
@@ -58,7 +64,13 @@ kk_CreateBuffer(VkDevice device, const VkBufferCreateInfo *pCreateInfo,
       buffer->metal.offset = 0u;
       buffer->vk.device_address =
          mtl_buffer_get_gpu_address(buffer->metal.handle);
-      kk_sparse_buffer_init(buffer);
+
+      VkResult result = kk_sparse_buffer_init(dev, buffer, mirror_tile);
+      if (result != VK_SUCCESS) {
+         mtl_release(buffer->metal.handle);
+         vk_buffer_destroy(&dev->vk, pAllocator, &buffer->vk);
+         return result;
+      }
 
       kk_device_add_buffer_to_residency_set(dev, buffer->metal.handle);
    }
@@ -237,7 +249,7 @@ kk_GetBufferDeviceAddress(UNUSED VkDevice device,
 {
    VK_FROM_HANDLE(kk_buffer, buffer, pInfo->buffer);
 
-   return vk_buffer_address(&buffer->vk, 0);
+   return kk_buffer_shader_addr_range(buffer, 0, VK_WHOLE_SIZE).addr;
 }
 
 VKAPI_ATTR uint64_t VKAPI_CALL

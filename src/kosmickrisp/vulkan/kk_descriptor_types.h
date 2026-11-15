@@ -47,9 +47,16 @@ struct kk_sampled_image_descriptor {
    uint16_t reduction_sampler_index;
    int16_t reduction_clamp_0_sampler_index_or_negative;
 
-   uint16_t pad_to_32_bits;
+   /* The sampler loads with residency sample the residency shadow with:
+    * white borders, no comparison */
+   uint16_t residency_sampler_index;
+
    uint32_t border[4];
-   uint64_t pad_to_power_2[2];
+
+   /* The view of the image's residency shadow, 0 when the image has none and
+    * is resident */
+   uint64_t residency_gpu_resource_id;
+   uint64_t pad_to_power_2;
 };
 
 static_assert(sizeof(struct kk_sampled_image_descriptor) == 64,
@@ -63,9 +70,12 @@ static_assert(offsetof(struct kk_sampled_image_descriptor, reduction) % 8 ==
 
 struct kk_storage_image_descriptor {
    uint64_t image_gpu_resource_id;
+
+   /* As in kk_sampled_image_descriptor */
+   uint64_t residency_gpu_resource_id;
 };
 
-static_assert(sizeof(struct kk_storage_image_descriptor) == 8,
+static_assert(sizeof(struct kk_storage_image_descriptor) == 16,
               "kk_storage_image_descriptor has no holes");
 
 struct kk_texel_buffer_descriptor {
@@ -75,10 +85,17 @@ struct kk_texel_buffer_descriptor {
     * first texel, added to every coordinate in the shader.
     */
    uint32_t offset_el;
+
+   /* For loads with residency, stores and atomics: the texel size, and where
+    * the buffer's residency mirror holds the Metal texture's 64 KB tiles and
+    * how many. A zero address is resident. */
+   uint32_t texel_size_B;
+   uint64_t residency_addr;
+   uint32_t residency_tiles;
    uint32_t pad;
 };
 
-static_assert(sizeof(struct kk_texel_buffer_descriptor) == 16,
+static_assert(sizeof(struct kk_texel_buffer_descriptor) == 32,
               "kk_texel_buffer_descriptor has no holes");
 
 /* Texel buffers are read through both the sampled and the storage image

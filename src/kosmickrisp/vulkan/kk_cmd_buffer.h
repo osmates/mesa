@@ -49,6 +49,9 @@ struct kk_root_descriptor_table {
          uint32_t rasterizer_state;
          float depth_bias[4];
          float viewport_transform[KK_MAX_VIEWPORTS * 4];
+
+         /* Color attachments' residency shadow views by Metal slot, or 0 */
+         uint64_t color_residency[KK_MAX_RTS];
       } draw;
       struct {
          uint32_t base_group[3];

@@ -72,7 +72,7 @@ is_1d(nir_tex_instr *tex)
 static nir_tex_instr *
 build_tex(nir_builder *b, nir_tex_instr *tex, nir_texop op,
           nir_alu_type dest_type, unsigned bit_size, nir_def *coord,
-          nir_def *lod, bool sparse)
+          nir_def *lod)
 {
    bool sampler = op == nir_texop_txl || op == nir_texop_lod ||
                   op == nir_texop_sampler_reduction_kk;
@@ -82,7 +82,6 @@ build_tex(nir_builder *b, nir_tex_instr *tex, nir_texop op,
    t->op = op;
    t->sampler_dim = tex->sampler_dim;
    t->is_array = tex->is_array;
-   t->is_sparse = sparse;
    t->dest_type = dest_type;
    t->texture_non_uniform = tex->texture_non_uniform;
    t->sampler_non_uniform = tex->sampler_non_uniform;
@@ -110,21 +109,9 @@ build_tex(nir_builder *b, nir_tex_instr *tex, nir_texop op,
 }
 
 static nir_def *
-reduce(nir_builder *b, nir_def *is_min, nir_def *x, nir_def *y, bool sparse)
+reduce(nir_builder *b, nir_def *is_min, nir_def *x, nir_def *y)
 {
-   unsigned n = x->num_components - sparse;
-   nir_def *xc = nir_trim_vector(b, x, n);
-   nir_def *yc = nir_trim_vector(b, y, n);
-   nir_def *res =
-      nir_bcsel(b, is_min, nir_fmin(b, xc, yc), nir_fmax(b, xc, yc));
-   if (!sparse)
-      return res;
-
-   nir_def *code =
-      nir_sparse_residency_code_and(b, nir_u2u32(b, nir_channel(b, x, n)),
-                                    nir_u2u32(b, nir_channel(b, y, n)));
-   return nir_vector_insert_imm(b, nir_pad_vector(b, res, n + 1),
-                                nir_u2uN(b, code, x->bit_size), n);
+   return nir_bcsel(b, is_min, nir_fmin(b, x, y), nir_fmax(b, x, y));
 }
 
 struct footprint {
@@ -152,9 +139,8 @@ read_texel(nir_builder *b, const struct footprint *fp, nir_def *pos,
    coord =
       nir_f2fN(b, coord, nir_get_tex_src(tex, nir_tex_src_coord)->bit_size);
 
-   nir_tex_instr *t =
-      build_tex(b, tex, nir_texop_txl, tex->dest_type, tex->def.bit_size, coord,
-                level, tex->is_sparse);
+   nir_tex_instr *t = build_tex(b, tex, nir_texop_txl, tex->dest_type,
+                                tex->def.bit_size, coord, level);
    t->backend_flags = tex->backend_flags | KK_TEXTURE_FLAG_REDUCTION_TAP;
    return &t->def;
 }
@@ -175,11 +161,10 @@ static nir_def *
 reduce_level(nir_builder *b, const struct footprint *fp, nir_def *level)
 {
    nir_tex_instr *tex = fp->tex;
-   bool sparse = tex->is_sparse;
    bool cube = tex->sampler_dim == GLSL_SAMPLER_DIM_CUBE;
 
    nir_def *size = &build_tex(b, tex, nir_texop_txs, nir_type_int32, 32, NULL,
-                              nir_f2i32(b, level), false)
+                              nir_f2i32(b, level))
                        ->def;
    size = nir_i2f32(b, nir_trim_vector(b, size, cube ? 1 : fp->dims));
 
@@ -234,7 +219,7 @@ reduce_level(nir_builder *b, const struct footprint *fp, nir_def *level)
             nir_bcsel(b, z_major, sign, nir_bcsel(b, x_major, fs, ft)));
 
          nir_def *v = read_texel(b, fp, dir, level);
-         res = res ? reduce(b, fp->is_min, res, v, sparse) : v;
+         res = res ? reduce(b, fp->is_min, res, v) : v;
       }
 
       return res;
@@ -262,7 +247,7 @@ reduce_level(nir_builder *b, const struct footprint *fp, nir_def *level)
       }
 
       nir_def *v = read_texel(b, fp, nir_vec(b, comps, fp->dims), level);
-      res = res ? reduce(b, fp->is_min, res, v, sparse) : v;
+      res = res ? reduce(b, fp->is_min, res, v) : v;
    }
 
    return res;
@@ -302,7 +287,7 @@ emulate(nir_builder *b, nir_tex_instr *tex, nir_def *params,
    } else if (ddx) {
       nir_def *ddy = nir_get_tex_src(tex, nir_tex_src_ddy);
       nir_def *size = &build_tex(b, tex, nir_texop_txs, nir_type_int32, 32,
-                                 NULL, nir_imm_int(b, 0), false)
+                                 NULL, nir_imm_int(b, 0))
                           ->def;
       size = nir_i2f32(b, nir_trim_vector(b, size, dims));
       nir_def *rx = nir_fast_length(b, nir_fmul(b, nir_f2f32(b, ddx), size));
@@ -314,7 +299,7 @@ emulate(nir_builder *b, nir_tex_instr *tex, nir_def *params,
          &build_tex(
              b, tex, nir_texop_lod, nir_type_float32, 32,
              nir_trim_vector(b, nir_get_tex_src(tex, nir_tex_src_coord), dims),
-             NULL, false)
+             NULL)
              ->def;
       lambda = nir_channel(b, query, 1);
    } else {
@@ -337,16 +322,15 @@ emulate(nir_builder *b, nir_tex_instr *tex, nir_def *params,
    fp.linear = nir_ine_imm(b, nir_iand(b, flags, filter_bit), 0);
 
    /* Levels relative to the view's base level */
-   nir_def *levels = &build_tex(b, tex, nir_texop_query_levels, nir_type_int32,
-                                32, NULL, NULL, false)
-                         ->def;
+   nir_def *levels =
+      &build_tex(b, tex, nir_texop_query_levels, nir_type_int32, 32, NULL, NULL)
+          ->def;
    nir_def *q = nir_i2f32(b, nir_iadd_imm(b, levels, -1));
    nir_def *d = nir_fmin(b, nir_fmax(b, lambda, nir_imm_float(b, 0.0)), q);
    if (ctx->view_min_lod) {
-      nir_def *view_min_lod =
-         &build_tex(b, tex, nir_texop_image_min_lod_agx, nir_type_float16, 16,
-                    NULL, NULL, false)
-             ->def;
+      nir_def *view_min_lod = &build_tex(b, tex, nir_texop_image_min_lod_agx,
+                                         nir_type_float16, 16, NULL, NULL)
+                                  ->def;
       d = nir_fmax(b, d, nir_f2f32(b, view_min_lod));
    }
 
@@ -362,8 +346,7 @@ emulate(nir_builder *b, nir_tex_instr *tex, nir_def *params,
    nir_def *both;
    nir_push_if(b, second);
    {
-      both =
-         reduce(b, fp.is_min, res, reduce_level(b, &fp, d_lo), tex->is_sparse);
+      both = reduce(b, fp.is_min, res, reduce_level(b, &fp, d_lo));
    }
    nir_pop_if(b, NULL);
 
@@ -373,6 +356,10 @@ emulate(nir_builder *b, nir_tex_instr *tex, nir_def *params,
 static bool
 needs_lowering(nir_tex_instr *tex, const struct lower_minmax_ctx *ctx)
 {
+   /* Residency samplers average */
+   if (tex->backend_flags & KK_TEXTURE_FLAG_RESIDENCY)
+      return false;
+
    switch (tex->op) {
    case nir_texop_tex:
    case nir_texop_txb:
@@ -411,7 +398,7 @@ lower(nir_builder *b, nir_tex_instr *tex, const struct lower_minmax_ctx *ctx)
    nir_def *hw = &nir_instr_as_tex(hw_instr)->def;
 
    nir_def *params = &build_tex(b, tex, nir_texop_sampler_reduction_kk,
-                                nir_type_uint16, 16, NULL, NULL, false)
+                                nir_type_uint16, 16, NULL, NULL)
                          ->def;
    nir_def *mode = nir_iand_imm(b, nir_u2u32(b, nir_channel(b, params, 0)),
                                 KK_REDUCTION_MODE_MASK);

@@ -21,6 +21,16 @@ struct kk_device;
 struct kk_queue;
 struct vk_queue_submit;
 
+/* Contents of the heaps residency shadows map: 0xff bytes for unorm shadows
+ * and residency mirrors, 1.0f for float shadows, and ASTC blocks of constant
+ * white for ASTC shadows. */
+enum kk_sparse_ones {
+   KK_SPARSE_ONES_UNORM,
+   KK_SPARSE_ONES_FLOAT,
+   KK_SPARSE_ONES_ASTC,
+   KK_SPARSE_ONES_COUNT,
+};
+
 struct kk_sparse_device {
    bool enabled;
 
@@ -42,6 +52,11 @@ struct kk_sparse_device {
    /* Freed memory whose last tile unmapped, released once the unmaps are
     * queued */
    struct util_dynarray released;
+
+   /* What residency shadows and residency mirrors map while their tiles are
+    * mapped, by enum kk_sparse_ones. Made when the device enables sparse
+    * residency. */
+   struct kk_bo *ones[KK_SPARSE_ONES_COUNT];
 };
 
 /* What the tiles of a sparse resource map from, as ranges of consecutive
@@ -75,7 +90,10 @@ void kk_sparse_tiles_finish(struct kk_device *dev,
  * goes with the last of them */
 bool kk_sparse_keep_memory(struct kk_device *dev, struct kk_bo *bo);
 
-void kk_sparse_buffer_init(struct kk_buffer *buffer);
+uint64_t kk_sparse_buffer_mirror_tile(const struct kk_device *dev,
+                                      const struct kk_buffer *buffer);
+VkResult kk_sparse_buffer_init(struct kk_device *dev, struct kk_buffer *buffer,
+                               uint64_t mirror_tile);
 void kk_sparse_buffer_finish(struct kk_device *dev, struct kk_buffer *buffer);
 
 void kk_sparse_buffer_add_view(struct kk_device *dev, struct kk_buffer *buffer,

@@ -190,12 +190,24 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          mtl_handle = image->planes[image_plane].mtl_handle_array;
       }
 
+      mtl_texture *shadow = plane->sparse.shadow;
+      struct kk_view_layout shadow_layout = view_layout;
+      shadow_layout.format.mtl = plane->sparse.shadow_format;
+
       if (view->vk.usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
          view->planes[view_plane].mtl_handle_sampled =
             mtl_new_texture_view_with(mtl_handle, &view_layout, true);
          view->planes[view_plane].sampled_gpu_resource_id =
             mtl_texture_get_gpu_resource_id(
                view->planes[view_plane].mtl_handle_sampled);
+
+         if (shadow != NULL) {
+            view->planes[view_plane].mtl_handle_residency_sampled =
+               mtl_new_texture_view_with(shadow, &shadow_layout, false);
+            view->planes[view_plane].residency_sampled_gpu_resource_id =
+               mtl_texture_get_gpu_resource_id(
+                  view->planes[view_plane].mtl_handle_residency_sampled);
+         }
       }
 
       if (view->vk.usage & VK_IMAGE_USAGE_STORAGE_BIT) {
@@ -209,6 +221,27 @@ kk_image_view_init(struct kk_device *dev, struct kk_image_view *view,
          view->planes[view_plane].storage_gpu_resource_id =
             mtl_texture_get_gpu_resource_id(
                view->planes[view_plane].mtl_handle_storage);
+
+         if (shadow != NULL) {
+            shadow_layout.view_type = view_layout.view_type;
+            view->planes[view_plane].mtl_handle_residency_storage =
+               mtl_new_texture_view_with(shadow, &shadow_layout, false);
+            view->planes[view_plane].residency_storage_gpu_resource_id =
+               mtl_texture_get_gpu_resource_id(
+                  view->planes[view_plane].mtl_handle_residency_storage);
+         }
+      }
+
+      if (shadow != NULL &&
+          (view->vk.usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)) {
+         shadow_layout.view_type = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+         shadow_layout.num_levels = 1u;
+         shadow_layout.min_lod_clamp = 0.0f;
+         view->planes[view_plane].mtl_handle_residency_render =
+            mtl_new_texture_view_with(shadow, &shadow_layout, false);
+         view->planes[view_plane].residency_render_gpu_resource_id =
+            mtl_texture_get_gpu_resource_id(
+               view->planes[view_plane].mtl_handle_residency_render);
       }
 
       if (view->vk.usage & (VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
@@ -278,6 +311,15 @@ kk_image_view_finish(struct kk_device *dev, struct kk_image_view *view)
 
       if (view->planes[plane].mtl_handle_subres)
          mtl_release(view->planes[plane].mtl_handle_subres);
+
+      if (view->planes[plane].mtl_handle_residency_sampled)
+         mtl_release(view->planes[plane].mtl_handle_residency_sampled);
+
+      if (view->planes[plane].mtl_handle_residency_storage)
+         mtl_release(view->planes[plane].mtl_handle_residency_storage);
+
+      if (view->planes[plane].mtl_handle_residency_render)
+         mtl_release(view->planes[plane].mtl_handle_residency_render);
    }
 
    vk_image_view_finish(&view->vk);

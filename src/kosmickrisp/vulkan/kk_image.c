@@ -808,6 +808,88 @@ kk_image_plane_init_sparse(struct kk_device *dev, struct kk_image_plane *plane)
    return VK_SUCCESS;
 }
 
+/* A filterable format with the image format's texel size, so the same tiles
+ * and tail, and the heap of ones that reads 1.0 in it */
+static enum mtl_pixel_format
+kk_sparse_shadow_format(enum pipe_format format, uint32_t mtl_format,
+                        enum kk_sparse_ones *ones)
+{
+   if (mtl_format >= MTL_PIXEL_FORMAT_ASTC_4x4_SRGB &&
+       mtl_format <= MTL_PIXEL_FORMAT_ASTC_12x12_SRGB) {
+      *ones = KK_SPARSE_ONES_ASTC;
+      return mtl_format + MTL_PIXEL_FORMAT_ASTC_4x4 -
+             MTL_PIXEL_FORMAT_ASTC_4x4_SRGB;
+   }
+   if (mtl_format >= MTL_PIXEL_FORMAT_ASTC_4x4 &&
+       mtl_format <= MTL_PIXEL_FORMAT_ASTC_12x12) {
+      *ones = KK_SPARSE_ONES_ASTC;
+      return mtl_format;
+   }
+   if (mtl_format >= MTL_PIXEL_FORMAT_ASTC_4x4_FLOAT &&
+       mtl_format <= MTL_PIXEL_FORMAT_ASTC_12x12_FLOAT) {
+      *ones = KK_SPARSE_ONES_ASTC;
+      return mtl_format - MTL_PIXEL_FORMAT_ASTC_4x4_FLOAT +
+             MTL_PIXEL_FORMAT_ASTC_4x4;
+   }
+
+   *ones = KK_SPARSE_ONES_UNORM;
+   switch (util_format_get_blocksize(format)) {
+   case 1:
+      return MTL_PIXEL_FORMAT_R8_UNORM;
+   case 2:
+      return MTL_PIXEL_FORMAT_R16_UNORM;
+   case 4:
+      return MTL_PIXEL_FORMAT_R8G8B8A8_UNORM;
+   case 8:
+      return MTL_PIXEL_FORMAT_R16G16B16A16_UNORM;
+   case 16:
+      *ones = KK_SPARSE_ONES_FLOAT;
+      return MTL_PIXEL_FORMAT_R32G32B32A32_FLOAT;
+   default:
+      return MTL_PIXEL_FORMAT_INVALID;
+   }
+}
+
+/* Metal's sparse residency queries go wrong through views that start past
+ * level 0, and in arrays with tails, while plain reads of the same textures
+ * are right. Residency comes from a shadow texture instead: the image's
+ * size, levels, layers and usage in a filterable format of the same texel
+ * size, which gets the same tiles and tail, with a heap of ones mapped
+ * wherever the image maps memory. A sample through the same view, sampler
+ * and coordinates gives 1.0 where every texel the filter weighs is mapped.
+ * Storage writes, atomics and framebuffer reads check it too.
+ */
+static VkResult
+kk_image_plane_init_shadow(struct kk_device *dev, struct kk_image_plane *plane)
+{
+   struct kk_image_sparse *sparse = &plane->sparse;
+   struct kk_image_layout layout = plane->layout;
+
+   layout.format.mtl = kk_sparse_shadow_format(
+      layout.format.pipe, layout.format.mtl, &sparse->shadow_ones);
+   layout.usage &= ~MTL_TEXTURE_USAGE_SHADER_ATOMIC;
+   if (layout.format.mtl == MTL_PIXEL_FORMAT_INVALID)
+      return vk_error(dev, VK_ERROR_FORMAT_NOT_SUPPORTED);
+
+   sparse->shadow = mtl_new_placement_sparse_texture(dev->mtl_handle, &layout);
+   if (sparse->shadow == NULL)
+      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+
+   const struct mtl_size tile = mtl_placement_sparse_tile_size(
+      dev->mtl_handle, layout.type, layout.format.mtl, layout.sample_count_sa);
+   if (tile.x != sparse->tile_px.x || tile.y != sparse->tile_px.y ||
+       tile.z != sparse->tile_px.z ||
+       mtl_texture_first_mipmap_in_tail(sparse->shadow) !=
+          mtl_texture_first_mipmap_in_tail(plane->mtl_handle) ||
+       mtl_texture_tail_size_in_bytes(sparse->shadow) !=
+          mtl_texture_tail_size_in_bytes(plane->mtl_handle))
+      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "Residency shadow has other tiles than its image");
+
+   sparse->shadow_format = layout.format.mtl;
+   return VK_SUCCESS;
+}
+
 static VkResult
 kk_image_init(struct kk_device *dev, struct kk_image *image,
               const VkImageCreateInfo *pCreateInfo)
@@ -856,6 +938,18 @@ kk_image_init(struct kk_device *dev, struct kk_image *image,
       VkResult result = kk_image_plane_init_sparse(dev, &image->planes[0]);
       if (result != VK_SUCCESS)
          return result;
+
+      const VkImageUsageFlags shadow_usage =
+         VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+         (dev->vk.enabled_features.shaderResourceResidency
+             ? VK_IMAGE_USAGE_SAMPLED_BIT
+             : 0);
+      if ((image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) &&
+          (image->vk.usage & shadow_usage)) {
+         result = kk_image_plane_init_shadow(dev, &image->planes[0]);
+         if (result != VK_SUCCESS)
+            return result;
+      }
    }
 
    return VK_SUCCESS;
@@ -879,6 +973,8 @@ kk_image_plane_finish(struct kk_device *dev, struct kk_image_plane *plane,
       mtl_release(plane->mtl_handle);
    if (plane->mtl_handle_array != NULL)
       mtl_release(plane->mtl_handle_array);
+   if (plane->sparse.shadow != NULL)
+      mtl_release(plane->sparse.shadow);
 }
 
 static void
@@ -918,8 +1014,13 @@ kk_CreateImage(VkDevice _device, const VkImageCreateInfo *pCreateInfo,
       return result;
    }
 
-   if (kk_image_is_sparse(image))
+   if (kk_image_is_sparse(image)) {
       kk_device_add_texture_to_residency_set(dev, image->planes[0].mtl_handle);
+      if (image->planes[0].sparse.shadow != NULL) {
+         kk_device_add_texture_to_residency_set(dev,
+                                                image->planes[0].sparse.shadow);
+      }
+   }
 
    *pImage = kk_image_to_handle(image);
 
@@ -940,6 +1041,8 @@ kk_DestroyImage(VkDevice device, VkImage _image,
       struct kk_image_sparse *sparse = &image->planes[0].sparse;
       kk_device_remove_texture_from_residency_set(dev,
                                                   image->planes[0].mtl_handle);
+      if (sparse->shadow != NULL)
+         kk_device_remove_texture_from_residency_set(dev, sparse->shadow);
       if (sparse->tail_heap != NULL) {
          kk_device_remove_heap_from_residency_set(dev, sparse->tail_heap);
          mtl_release(sparse->tail_heap);

@@ -205,6 +205,7 @@ static void
 kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
                          struct kk_rendering_state *render,
                          const struct vk_dynamic_graphics_state *dyn,
+                         struct kk_descriptor_state *desc,
                          bool force_attachment_load,
                          bool rendering_to_whole_framebuffer)
 {
@@ -213,6 +214,9 @@ kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
          mtl_render_pass_descriptor_get_color_attachment(pass_descriptor, i);
       kk_clear_common_attachment_description(attachment_descriptor);
    }
+   memset(desc->root.draw.color_residency, 0,
+          sizeof(desc->root.draw.color_residency));
+   desc->root_dirty = true;
    for (uint32_t i = 0; i < ARRAY_SIZE(render->color_att); i++) {
       struct kk_attachment *color_att = &render->color_att[i];
       const struct kk_image_view *iview = color_att->iview;
@@ -231,6 +235,8 @@ kk_set_color_attachments(mtl_render_pass_descriptor *pass_descriptor,
       const struct kk_image *image =
          container_of(iview->vk.image, struct kk_image, vk);
       render->samples = MAX2(render->samples, image->vk.samples);
+      desc->root.draw.color_residency[logical_index] =
+         iview->planes[0].residency_render_gpu_resource_id;
 
       bool renderpass_resolve = kk_attachment_do_renderpass_resolve(
          &render->color_att[i], rendering_to_whole_framebuffer,
@@ -371,7 +377,8 @@ kk_CmdBeginRendering(VkCommandBuffer commandBuffer,
    render->force_attachment_store =
       !is_whole_framebuffer || (render->flags & VK_RENDERING_SUSPENDING_BIT);
 
-   kk_set_color_attachments(pass_descriptor, render, dyn, force_attachment_load,
+   kk_set_color_attachments(pass_descriptor, render, dyn,
+                            &cmd->state.gfx.descriptors, force_attachment_load,
                             is_whole_framebuffer);
 
    if (render->depth_att.iview) {
@@ -1070,7 +1077,8 @@ kk_flush_render_pass(struct kk_cmd_buffer *cmd)
          kk_apply_attachment_store_ops(cmd, true);
 
          kk_set_color_attachments(
-            cmd->state.gfx.render_pass_descriptor, render, dyn, true,
+            cmd->state.gfx.render_pass_descriptor, render, dyn,
+            &cmd->state.gfx.descriptors, true,
             cmd->state.gfx.render.rendering_to_whole_framebuffer);
          needs_restart = true;
          color_attachment_map_changed = true;

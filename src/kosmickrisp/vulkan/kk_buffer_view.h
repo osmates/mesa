@@ -36,6 +36,13 @@ struct kk_buffer_view {
       uint64_t first_tile;
       uint64_t tile_count;
    } sparse;
+
+   /* Where loads with residency and stores find the view's tiles in the
+    * buffer's residency mirror, how many there are and the texel size. 0 for
+    * views without a mirror, which are resident. */
+   uint64_t residency_addr;
+   uint32_t residency_tiles;
+   uint32_t texel_size_B;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_buffer_view, vk.base, VkBufferView,

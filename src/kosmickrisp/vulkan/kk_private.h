@@ -44,6 +44,16 @@
  * standard sparse block shapes. */
 #define KK_SPARSE_PAGE_SIZE_B (64u * 1024u)
 
+/* Residency shadows and residency mirrors map tiles of heaps of ones, of this
+ * many 64 KB tiles */
+#define KK_SPARSE_ONES_TILES 16u
+
+/* Shaders see the address of a sparse buffer with a residency mirror with
+ * log2 of the mirror's distance, less 15, in these bits. Metal's addresses
+ * stay below them, and tagged ones stay below 2^48. */
+#define KK_SPARSE_TAG_SHIFT 43u
+#define KK_SPARSE_TAG_BITS  5u
+
 /* Max size of a bound cbuf */
 #define KK_MAX_CBUF_SIZE (1u << 16)
 

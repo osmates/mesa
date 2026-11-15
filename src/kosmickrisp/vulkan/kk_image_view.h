@@ -47,6 +47,16 @@ struct kk_image_view {
       uint64_t sampled_gpu_resource_id;
       uint64_t storage_gpu_resource_id;
       uint64_t input_gpu_resource_id;
+
+      /* Views of the image's residency shadow, as the sampled and storage
+       * views see the image, for loads with residency, and as a 2D array of
+       * the color attachment's level and layers, for framebuffer reads */
+      mtl_texture *mtl_handle_residency_sampled;
+      mtl_texture *mtl_handle_residency_storage;
+      mtl_texture *mtl_handle_residency_render;
+      uint64_t residency_sampled_gpu_resource_id;
+      uint64_t residency_storage_gpu_resource_id;
+      uint64_t residency_render_gpu_resource_id;
    } planes[3];
 };
 

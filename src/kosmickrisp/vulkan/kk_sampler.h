@@ -39,6 +39,9 @@ struct kk_sampler {
 
    /* Nearest samplers for the emulation, clamp=0 only with a custom border */
    struct kk_rc_sampler *reduction_hw[2];
+
+   /* For residency shadows: white borders, no comparison, no reduction */
+   struct kk_rc_sampler *residency_hw;
 };
 
 VK_DEFINE_NONDISP_HANDLE_CASTS(kk_sampler, vk.base, VkSampler,

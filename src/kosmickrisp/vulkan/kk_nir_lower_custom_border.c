@@ -38,6 +38,10 @@ lower(nir_builder *b, nir_tex_instr *tex, UNUSED void *_data)
    if (!nir_tex_instr_need_sampler(tex) || nir_tex_instr_is_query(tex))
       return false;
 
+   /* Residency samplers have white borders */
+   if (tex->backend_flags & KK_TEXTURE_FLAG_RESIDENCY)
+      return false;
+
    /* XXX: this is a really weird edge case, is this even well-defined? */
    if (tex->is_shadow)
       return false;

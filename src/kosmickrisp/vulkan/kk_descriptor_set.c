@@ -80,6 +80,11 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
          float min_lod = MAX2(view->vk.min_lod - view->vk.base_mip_level, 0.0);
          desc[plane].image_min_lod_fp16 = _mesa_float_to_half(min_lod);
          desc[plane].image_min_lod_uint16 = min_lod;
+
+         if (!is_input_attachment) {
+            desc[plane].residency_gpu_resource_id =
+               view->planes[plane].residency_sampled_gpu_resource_id;
+         }
       }
    }
 
@@ -110,6 +115,8 @@ get_sampled_image_view_desc(VkDescriptorType descriptor_type,
             sampler->reduction_hw[0] ? sampler->reduction_hw[0]->index : 0;
          desc[plane].reduction_clamp_0_sampler_index_or_negative =
             sampler->reduction_hw[1] ? sampler->reduction_hw[1]->index : -1;
+         desc[plane].residency_sampler_index =
+            sampler->residency_hw ? sampler->residency_hw->index : 0;
       }
 
       if (sampler->has_border) {
@@ -173,6 +180,8 @@ get_storage_image_view_desc(
 
       assert(view->planes[plane].storage_gpu_resource_id);
       desc.image_gpu_resource_id = view->planes[plane].storage_gpu_resource_id;
+      desc.residency_gpu_resource_id =
+         view->planes[plane].residency_storage_gpu_resource_id;
    }
 
    assert(sizeof(desc) <= dst_size);
@@ -194,12 +203,14 @@ write_storage_image_view_desc(struct kk_descriptor_set *set,
 static void
 write_buffer_desc(struct kk_descriptor_set *set,
                   const VkDescriptorBufferInfo *const info, uint32_t binding,
-                  uint32_t elem)
+                  uint32_t elem, VkDescriptorType type)
 {
    VK_FROM_HANDLE(kk_buffer, buffer, info->buffer);
 
    const struct kk_addr_range addr_range =
-      kk_buffer_addr_range(buffer, info->offset, info->range);
+      type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+         ? kk_buffer_shader_addr_range(buffer, info->offset, info->range)
+         : kk_buffer_addr_range(buffer, info->offset, info->range);
    assert(addr_range.range <= UINT32_MAX);
 
    const struct kk_buffer_address desc = {
@@ -212,14 +223,17 @@ write_buffer_desc(struct kk_descriptor_set *set,
 static void
 write_dynamic_buffer_desc(struct kk_descriptor_set *set,
                           const VkDescriptorBufferInfo *const info,
-                          uint32_t binding, uint32_t elem)
+                          uint32_t binding, uint32_t elem,
+                          VkDescriptorType type)
 {
    VK_FROM_HANDLE(kk_buffer, buffer, info->buffer);
    const struct kk_descriptor_set_binding_layout *binding_layout =
       &set->layout->binding[binding];
 
    const struct kk_addr_range addr_range =
-      kk_buffer_addr_range(buffer, info->offset, info->range);
+      type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC
+         ? kk_buffer_shader_addr_range(buffer, info->offset, info->range)
+         : kk_buffer_addr_range(buffer, info->offset, info->range);
    assert(addr_range.range <= UINT32_MAX);
 
    struct kk_buffer_address *desc =
@@ -244,6 +258,9 @@ write_buffer_view_desc(struct kk_descriptor_set *set,
 
       desc.image_gpu_resource_id = view->texel_buffer_gpu_id;
       desc.offset_el = view->offset_el;
+      desc.texel_size_B = view->texel_size_B;
+      desc.residency_addr = view->residency_addr;
+      desc.residency_tiles = view->residency_tiles;
    }
    write_desc(set, binding, elem, &desc, sizeof(desc));
 }
@@ -300,16 +317,17 @@ kk_UpdateDescriptorSets(VkDevice device, uint32_t descriptorWriteCount,
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
             write_buffer_desc(set, write->pBufferInfo + j, write->dstBinding,
-                              write->dstArrayElement + j);
+                              write->dstArrayElement + j,
+                              write->descriptorType);
          }
          break;
 
       case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
-            write_dynamic_buffer_desc(set, write->pBufferInfo + j,
-                                      write->dstBinding,
-                                      write->dstArrayElement + j);
+            write_dynamic_buffer_desc(
+               set, write->pBufferInfo + j, write->dstBinding,
+               write->dstArrayElement + j, write->descriptorType);
          }
          break;
 
@@ -420,7 +438,8 @@ kk_push_descriptor_set_update(struct kk_push_descriptor_set *push_set,
       case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
          for (uint32_t j = 0; j < write->descriptorCount; j++) {
             write_buffer_desc(&set, write->pBufferInfo + j, write->dstBinding,
-                              write->dstArrayElement + j);
+                              write->dstArrayElement + j,
+                              write->descriptorType);
          }
          break;
 
@@ -790,7 +809,7 @@ kk_descriptor_set_write_template(
                data + entry->offset + j * entry->stride;
 
             write_buffer_desc(set, info, entry->binding,
-                              entry->array_element + j);
+                              entry->array_element + j, entry->type);
          }
          break;
 
@@ -801,7 +820,7 @@ kk_descriptor_set_write_template(
                data + entry->offset + j * entry->stride;
 
             write_dynamic_buffer_desc(set, info, entry->binding,
-                                      entry->array_element + j);
+                                      entry->array_element + j, entry->type);
          }
          break;
 

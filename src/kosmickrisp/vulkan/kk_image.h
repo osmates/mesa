@@ -56,6 +56,15 @@ struct kk_image_sparse {
    /* Backs a tail that takes more heap tiles than its region while it is
     * bound to scattered memory, made on the first such bind */
    mtl_heap *tail_heap;
+
+   /* Residency for loads with residency, storage writes and framebuffer
+    * reads: the same tiles as the image, mapped to a heap of ones wherever the
+    * image's are mapped. Only for sparse residency images with storage or
+    * color attachment usage, or sampled usage on a device with
+    * shaderResourceResidency. */
+   mtl_texture *shadow;
+   uint32_t shadow_format;
+   enum kk_sparse_ones shadow_ones;
 };
 
 struct kk_image_plane {

@@ -181,6 +181,8 @@ enum kk_feature_key {
    KK_FEAT_NULL_DESCRIPTOR = BITFIELD_BIT(1),
    KK_FEAT_IMAGE_VIEW_MIN_LOD_EMULATED = BITFIELD_BIT(2),
    KK_FEAT_SAMPLER_MINMAX = BITFIELD_BIT(3),
+   KK_FEAT_SPARSE_BUFFER = BITFIELD_BIT(4),
+   KK_FEAT_SPARSE_IMAGE = BITFIELD_BIT(5),
 };
 
 static enum kk_feature_key
@@ -197,6 +199,12 @@ kk_make_feature_key(const struct vk_features *feats,
       key |= KK_FEAT_IMAGE_VIEW_MIN_LOD_EMULATED;
    if (feats->samplerFilterMinmax)
       key |= KK_FEAT_SAMPLER_MINMAX;
+   /* Writes, atomics and framebuffer reads check residency where resources
+    * can be sparse */
+   if (feats->sparseResidencyBuffer)
+      key |= KK_FEAT_SPARSE_BUFFER;
+   if (feats->sparseResidencyImage2D)
+      key |= KK_FEAT_SPARSE_IMAGE;
    return key;
 }
 
@@ -778,6 +786,9 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
    NIR_PASS(_, nir, nir_lower_explicit_io, nir_var_mem_ubo,
             kk_buffer_addr_format(rs->uniform_buffers));
 
+   if (features & KK_FEAT_SPARSE_BUFFER)
+      NIR_PASS(_, nir, kk_nir_lower_sparse_buffer_access);
+
    NIR_PASS(_, nir, nir_lower_io, nir_var_shader_in | nir_var_shader_out,
             type_size_vec4,
             nir_lower_io_lower_64bit_to_32 |
@@ -828,6 +839,10 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
       kk_lower_fs(dev, nir, state);
    }
 
+   /* Before the passes that change samples, which leave residency shadow
+    * reads alone */
+   NIR_PASS(_, nir, kk_nir_lower_residency);
+
    /* Before the custom border pass, which wraps each texel read */
    if (features & KK_FEAT_SAMPLER_MINMAX)
       NIR_PASS(_, nir, kk_nir_lower_sampler_minmax, set_layout_count,
@@ -843,8 +858,8 @@ kk_lower_nir(struct kk_device *dev, nir_shader *nir, bool emulated_stage,
     * generate a nir_intrinsic_load_blend_const_color_rgba which gets lowered by
     * the lower descriptor pass
     */
-   NIR_PASS(_, nir, kk_nir_lower_descriptors, rs, set_layout_count,
-            set_layouts);
+   NIR_PASS(_, nir, kk_nir_lower_descriptors, rs, set_layout_count, set_layouts,
+            features & KK_FEAT_SPARSE_BUFFER, features & KK_FEAT_SPARSE_IMAGE);
 
    /* KK_WORKAROUND_16 - must be called after kk_nir_lower_descriptors(), which
     * lowers all image intrinsics to be bindless */
@@ -1257,7 +1272,8 @@ kk_compile_shader(struct kk_device *dev, nir_shader *nir,
       msl_nir_lower_clip_cull_distance(nir, 0);
       /* Descriptors were lowered with the GS, this lowers the system values
        * the hardware vertex lowering added */
-      NIR_PASS(_, nir, kk_nir_lower_descriptors, robustness, 0, NULL);
+      NIR_PASS(_, nir, kk_nir_lower_descriptors, robustness, 0, NULL, false,
+               false);
    }
 
    /* KK_WORKAROUND_19 Only the stage that feeds geometry will be dispatched
@@ -1982,7 +1998,8 @@ kk_compile_gs_adjacency(struct kk_physical_device *pdev, nir_shader *nir,
    kk_lower_hw_vs(rast, state, info.mode == MESA_PRIM_POINTS,
                   info.polygon_points);
    msl_nir_lower_clip_cull_distance(rast, 0);
-   NIR_PASS(_, rast, kk_nir_lower_descriptors, robustness, 0, NULL);
+   NIR_PASS(_, rast, kk_nir_lower_descriptors, robustness, 0, NULL, false,
+            false);
    kk_compile_msl(pdev, rast, state, &shader->gs_rast_adjacency, false);
 }
 

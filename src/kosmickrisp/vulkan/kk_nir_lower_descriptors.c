@@ -29,6 +29,10 @@ struct lower_descriptors_ctx {
    bool clamp_desc_array_bounds;
    nir_address_format ubo_addr_format;
    nir_address_format ssbo_addr_format;
+
+   /* Storage writes, atomics and framebuffer reads check residency */
+   bool sparse_texel_buffers;
+   bool sparse_images;
 };
 
 static const struct kk_descriptor_set_binding_layout *
@@ -389,10 +393,138 @@ offset_texel_buffer_size(nir_builder *b, nir_def *size, nir_def *offset_el)
    nir_def_rewrite_uses_after(size, nir_vector_insert_imm(b, size, x, 0));
 }
 
+/* Whether the 64 KB tile of a texel buffer view's Metal texture that holds
+ * texel x is mapped, from the buffer's residency mirror. Views without a
+ * mirror are resident.
+ */
+static nir_def *
+load_texel_buffer_residency(nir_builder *b, nir_deref_instr *deref,
+                            nir_def *coord,
+                            const struct lower_descriptors_ctx *ctx)
+{
+   nir_def *addr = load_resource_deref_desc(
+      b, 1, 64, deref,
+      offsetof(struct kk_texel_buffer_descriptor, residency_addr), ctx);
+   nir_def *texel_B = load_resource_deref_desc(
+      b, 1, 32, deref,
+      offsetof(struct kk_texel_buffer_descriptor, texel_size_B), ctx);
+   nir_def *tiles = load_resource_deref_desc(
+      b, 1, 32, deref,
+      offsetof(struct kk_texel_buffer_descriptor, residency_tiles), ctx);
+
+   /* (x * texel_B) >> 16 without overflowing 32 bits */
+   nir_def *x = nir_u2u32(b, nir_channel(b, coord, 0));
+   nir_def *tile = nir_iadd(
+      b, nir_imul(b, nir_ushr_imm(b, x, 16), texel_B),
+      nir_ushr_imm(b, nir_imul(b, nir_iand_imm(b, x, 0xffff), texel_B), 16));
+   tile = nir_umin(b, tile, nir_usub_sat(b, tiles, nir_imm_int(b, 1)));
+
+   nir_def *resident = nir_imm_true(b);
+   nir_push_if(b, nir_ine_imm(b, addr, 0));
+   nir_def *page = nir_iadd(
+      b, addr, nir_imul_imm(b, nir_u2u64(b, tile), KK_SPARSE_PAGE_SIZE_B));
+   nir_def *mapped =
+      nir_ine_imm(b, nir_load_global_constant(b, 1, 32, page), 0);
+   nir_pop_if(b, NULL);
+
+   return nir_if_phi(b, mapped, resident);
+}
+
+/* Whether a texel of a storage image is mapped, from the image's residency
+ * shadow through a view of it like the storage view, where it reads 1.0 for
+ * mapped texels. Images without a shadow are resident.
+ */
+static nir_def *
+load_storage_image_residency(nir_builder *b, nir_deref_instr *deref,
+                             enum glsl_sampler_dim dim, bool array,
+                             nir_def *coord, nir_def *sample, nir_def *lod,
+                             const struct lower_descriptors_ctx *ctx)
+{
+   /* No sparse residency for 1D, 3D or multisampled images */
+   if (dim != GLSL_SAMPLER_DIM_2D && dim != GLSL_SAMPLER_DIM_CUBE)
+      return nir_imm_true(b);
+
+   const unsigned offs =
+      offsetof(struct kk_storage_image_descriptor, residency_gpu_resource_id);
+   nir_def *id = load_resource_deref_desc(b, 1, 64, deref, offs, ctx);
+   nir_def *no_shadow = nir_imm_true(b);
+
+   nir_push_if(b, nir_ine_imm(b, id, 0));
+   nir_def *handle = nir_load_texture_handle_kk(
+      b, 1, 64, load_resource_addr(b, 1, 64, deref, offs, ctx),
+      .dest_type = nir_type_float32, .image_dim = dim, .image_array = array,
+      .flags = MSL_ACCESS_READ);
+   nir_def *value = nir_bindless_image_load(
+      b, 4, 32, handle, coord, sample, lod, .image_dim = dim,
+      .image_array = array, .dest_type = nir_type_float32,
+      .access = ACCESS_NON_WRITEABLE);
+   nir_def *mapped = nir_feq_imm(b, nir_channel(b, value, 0), 1.0);
+   nir_pop_if(b, NULL);
+
+   return nir_if_phi(b, mapped, no_shadow);
+}
+
+/* Stores and atomics happen only where the image or texel buffer is
+ * resident, and atomics elsewhere return 0 */
+static void
+guard_image_write(nir_builder *b, nir_intrinsic_instr *intr,
+                  nir_deref_instr *deref,
+                  const struct lower_descriptors_ctx *ctx)
+{
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   if (dim == GLSL_SAMPLER_DIM_BUF ? !ctx->sparse_texel_buffers
+                                   : !ctx->sparse_images)
+      return;
+
+   /* No sparse residency for 1D, 3D or multisampled images */
+   if (dim != GLSL_SAMPLER_DIM_BUF && dim != GLSL_SAMPLER_DIM_2D &&
+       dim != GLSL_SAMPLER_DIM_CUBE)
+      return;
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *resident;
+   if (dim == GLSL_SAMPLER_DIM_BUF) {
+      /* The coordinate already counts from the Metal texture */
+      resident = load_texel_buffer_residency(b, deref, intr->src[1].ssa, ctx);
+   } else {
+      nir_def *lod = intr->intrinsic == nir_intrinsic_bindless_image_store
+                        ? intr->src[4].ssa
+                        : nir_imm_int(b, 0);
+      resident = load_storage_image_residency(
+         b, deref, dim, nir_intrinsic_image_array(intr), intr->src[1].ssa,
+         intr->src[2].ssa, lod, ctx);
+   }
+
+   const bool has_dest = nir_intrinsic_infos[intr->intrinsic].has_dest;
+   nir_def *zero =
+      has_dest ? nir_imm_zero(b, intr->def.num_components, intr->def.bit_size)
+               : NULL;
+   nir_push_if(b, resident);
+   nir_instr_remove(&intr->instr);
+   nir_builder_instr_insert(b, &intr->instr);
+   nir_pop_if(b, NULL);
+
+   if (has_dest) {
+      nir_def *phi = nir_if_phi(b, &intr->def, zero);
+      nir_def_rewrite_uses(&intr->def, phi);
+      nir_src_rewrite(
+         &nir_phi_get_src_from_block(nir_instr_as_phi(nir_def_instr(phi)),
+                                     intr->instr.block)
+             ->src,
+         &intr->def);
+   }
+}
+
+static bool lower_image_sparse_load(nir_builder *b, nir_intrinsic_instr *intr,
+                                    const struct lower_descriptors_ctx *ctx);
+
 static bool
 lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
                    const struct lower_descriptors_ctx *ctx)
 {
+   if (intr->intrinsic == nir_intrinsic_image_deref_sparse_load)
+      return lower_image_sparse_load(b, intr, ctx);
+
    b->cursor = nir_before_instr(&intr->instr);
    nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
 
@@ -446,6 +578,106 @@ lower_image_intrin(nir_builder *b, nir_intrinsic_instr *intr,
       }
    }
 
+   switch (intr->intrinsic) {
+   case nir_intrinsic_bindless_image_store:
+   case nir_intrinsic_bindless_image_atomic:
+   case nir_intrinsic_bindless_image_atomic_swap:
+      guard_image_write(b, intr, deref, ctx);
+      break;
+   default:
+      break;
+   }
+
+   return true;
+}
+
+static bool
+lower_image_sparse_load(nir_builder *b, nir_intrinsic_instr *intr,
+                        const struct lower_descriptors_ctx *ctx)
+{
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_deref_instr *deref = nir_src_as_deref(intr->src[0]);
+   const enum glsl_sampler_dim dim = nir_intrinsic_image_dim(intr);
+   const unsigned n = intr->def.num_components - 1u;
+
+   nir_intrinsic_instr *load =
+      nir_intrinsic_instr_create(b->shader, nir_intrinsic_image_deref_load);
+   for (unsigned i = 0; i < nir_intrinsic_infos[intr->intrinsic].num_srcs; i++)
+      load->src[i] = nir_src_for_ssa(intr->src[i].ssa);
+   nir_intrinsic_copy_const_indices(load, intr);
+   load->num_components = n;
+   nir_def_init(&load->instr, &load->def, n, intr->def.bit_size);
+   nir_builder_instr_insert(b, &load->instr);
+   lower_image_intrin(b, load, ctx);
+
+   b->cursor = nir_after_instr(&load->instr);
+   nir_def *resident;
+   if (dim == GLSL_SAMPLER_DIM_BUF) {
+      /* The load's coordinate already counts from the Metal texture */
+      resident = load_texel_buffer_residency(b, deref, load->src[1].ssa, ctx);
+   } else {
+      resident = load_storage_image_residency(
+         b, deref, dim, nir_intrinsic_image_array(intr), intr->src[1].ssa,
+         intr->src[2].ssa, intr->src[3].ssa, ctx);
+   }
+
+   nir_def *comps[NIR_MAX_VEC_COMPONENTS];
+   for (unsigned i = 0; i < n; i++)
+      comps[i] = nir_channel(b, &load->def, i);
+   comps[n] = nir_u2uN(b, nir_b2i32(b, resident), intr->def.bit_size);
+
+   nir_def_replace(&intr->def, nir_vec(b, comps, n + 1));
+   return true;
+}
+
+/* A color attachment keeps writes to unmapped tiles in tile memory until the
+ * pass ends, where blending and input attachments read them. Framebuffer
+ * reads return 0 where the attachment's residency shadow does not read 1.0.
+ */
+static bool
+lower_color_fetch(nir_builder *b, nir_intrinsic_instr *intr,
+                  const struct lower_descriptors_ctx *ctx)
+{
+   if (!ctx->sparse_images || b->shader->info.stage != MESA_SHADER_FRAGMENT)
+      return false;
+
+   const nir_io_semantics sem = nir_intrinsic_io_semantics(intr);
+   if (sem.location < FRAG_RESULT_DATA0)
+      return false;
+
+   const unsigned slot =
+      sem.location - FRAG_RESULT_DATA0 + nir_src_as_uint(intr->src[0]);
+   const unsigned offs =
+      kk_root_descriptor_offset(draw.color_residency) + slot * sizeof(uint64_t);
+
+   b->cursor = nir_before_instr(&intr->instr);
+   nir_def *id = load_root(b, 1, 64, nir_imm_int(b, offs), 8);
+   nir_def *no_shadow = nir_imm_true(b);
+
+   nir_push_if(b, nir_ine_imm(b, id, 0));
+   nir_def *addr =
+      nir_iadd_imm(b, nir_load_buffer_ptr_kk(b, 1, 64, .binding = 0), offs);
+   nir_def *handle =
+      nir_load_texture_handle_kk(b, 1, 64, addr, .dest_type = nir_type_float32,
+                                 .image_dim = GLSL_SAMPLER_DIM_2D,
+                                 .image_array = true, .flags = MSL_ACCESS_READ);
+   nir_def *pos = nir_f2u32(b, nir_load_frag_coord(b));
+   nir_def *coord = nir_vec4(b, nir_channel(b, pos, 0), nir_channel(b, pos, 1),
+                             nir_load_layer_id(b), nir_imm_int(b, 0));
+   nir_def *value = nir_bindless_image_load(
+      b, 4, 32, handle, coord, nir_imm_int(b, 0), nir_imm_int(b, 0),
+      .image_dim = GLSL_SAMPLER_DIM_2D, .image_array = true,
+      .dest_type = nir_type_float32, .access = ACCESS_NON_WRITEABLE);
+   nir_def *mapped = nir_feq_imm(b, nir_channel(b, value, 0), 1.0);
+   nir_pop_if(b, NULL);
+
+   nir_def *resident = nir_if_phi(b, mapped, no_shadow);
+
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *zero =
+      nir_imm_zero(b, intr->def.num_components, intr->def.bit_size);
+   nir_def_rewrite_uses_after(&intr->def,
+                              nir_bcsel(b, resident, &intr->def, zero));
    return true;
 }
 
@@ -454,6 +686,9 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
                  const struct lower_descriptors_ctx *ctx)
 {
    switch (intrin->intrinsic) {
+   case nir_intrinsic_load_output:
+      return lower_color_fetch(b, intrin, ctx);
+
    case nir_intrinsic_load_vulkan_descriptor:
       return try_lower_load_vulkan_descriptor(b, intrin, ctx);
 
@@ -538,6 +773,71 @@ try_lower_intrin(nir_builder *b, nir_intrinsic_instr *intrin,
    }
 }
 
+/* A read of the image's residency shadow, or 1.0 without a shadow. Texel
+ * buffers have no shadow and answer from their buffer's residency mirror.
+ */
+static bool
+lower_residency_tex(nir_builder *b, nir_tex_instr *tex, nir_def *texture,
+                    nir_def *sampler, uint64_t plane_offset_B,
+                    const struct lower_descriptors_ctx *ctx)
+{
+   nir_deref_instr *texture_deref = nir_src_as_deref(nir_src_for_ssa(texture));
+   nir_def *one = nir_imm_vec4(b, 1.0, 1.0, 1.0, 1.0);
+
+   if (tex->sampler_dim == GLSL_SAMPLER_DIM_BUF) {
+      int coord_index = nir_tex_instr_src_index(tex, nir_tex_src_coord);
+      nir_def *coord = offset_texel_buffer_coord(
+         b, tex->src[coord_index].src.ssa,
+         load_texel_buffer_offset_el(b, texture_deref, ctx));
+      nir_def *resident =
+         load_texel_buffer_residency(b, texture_deref, coord, ctx);
+      nir_def_replace(&tex->def,
+                      nir_bcsel(b, resident, one, nir_imm_zero(b, 4, 32)));
+      return true;
+   }
+
+   const unsigned offs =
+      plane_offset_B +
+      offsetof(struct kk_sampled_image_descriptor, residency_gpu_resource_id);
+   nir_def *id = load_resource_deref_desc(b, 1, 64, texture_deref, offs, ctx);
+   nir_def *resource_addr =
+      load_resource_addr(b, 1, 64, texture_deref, offs, ctx);
+   nir_def *sampler_index = NULL;
+   if (sampler != NULL) {
+      sampler_index = load_resource_deref_desc(
+         b, 1, 16, nir_src_as_deref(nir_src_for_ssa(sampler)),
+         plane_offset_B + offsetof(struct kk_sampled_image_descriptor,
+                                   residency_sampler_index),
+         ctx);
+   }
+
+   nir_push_if(b, nir_ine_imm(b, id, 0));
+   {
+      nir_def *handle = nir_load_texture_handle_kk(
+         b, 1, 64, resource_addr, .dest_type = nir_type_float32,
+         .image_dim = tex->sampler_dim, .image_array = tex->is_array);
+      nir_def *sampler_handle =
+         sampler_index ? nir_load_sampler_handle_kk(b, sampler_index) : NULL;
+
+      nir_instr_remove(&tex->instr);
+      nir_builder_instr_insert(b, &tex->instr);
+      tex->dest_type = nir_type_float32;
+      nir_tex_instr_add_src(tex, nir_tex_src_texture_handle, handle);
+      if (sampler_handle != NULL)
+         nir_tex_instr_add_src(tex, nir_tex_src_sampler_handle, sampler_handle);
+   }
+   nir_pop_if(b, NULL);
+
+   /* Every use moves to the phi, then the phi takes the shadow read back */
+   nir_def *phi = nir_if_phi(b, &tex->def, one);
+   nir_def_rewrite_uses(&tex->def, phi);
+   nir_src_rewrite(&nir_phi_get_src_from_block(
+                       nir_instr_as_phi(nir_def_instr(phi)), tex->instr.block)
+                       ->src,
+                   &tex->def);
+   return true;
+}
+
 static bool
 lower_tex(nir_builder *b, nir_tex_instr *tex,
           const struct lower_descriptors_ctx *ctx)
@@ -556,6 +856,9 @@ lower_tex(nir_builder *b, nir_tex_instr *tex,
       plane_ssa ? nir_src_as_uint(nir_src_for_ssa(plane_ssa)) : 0;
    const uint64_t plane_offset_B =
       plane * sizeof(struct kk_sampled_image_descriptor);
+
+   if (tex->backend_flags & KK_TEXTURE_FLAG_RESIDENCY)
+      return lower_residency_tex(b, tex, texture, sampler, plane_offset_B, ctx);
 
    /* LOD bias is passed in the descriptor set, rather than embedded into
     * the sampler descriptor. There's no spot in the hardware descriptor,
@@ -883,7 +1186,8 @@ bool
 kk_nir_lower_descriptors(nir_shader *nir,
                          const struct vk_pipeline_robustness_state *rs,
                          uint32_t set_layout_count,
-                         struct vk_descriptor_set_layout *const *set_layouts)
+                         struct vk_descriptor_set_layout *const *set_layouts,
+                         bool sparse_texel_buffers, bool sparse_images)
 {
    struct lower_descriptors_ctx ctx = {
       .clamp_desc_array_bounds =
@@ -894,6 +1198,8 @@ kk_nir_lower_descriptors(nir_shader *nir,
          rs->images != VK_PIPELINE_ROBUSTNESS_IMAGE_BEHAVIOR_DISABLED,
       .ssbo_addr_format = kk_buffer_addr_format(rs->storage_buffers),
       .ubo_addr_format = kk_buffer_addr_format(rs->uniform_buffers),
+      .sparse_texel_buffers = sparse_texel_buffers,
+      .sparse_images = sparse_images,
    };
 
    assert(set_layout_count <= KK_MAX_SETS);
@@ -907,8 +1213,10 @@ kk_nir_lower_descriptors(nir_shader *nir,
     * TODO: See if we can unify this, not sure if the fast path matters on
     * Apple. This is inherited from NVK.
     */
+   /* Loads with residency, and stores, atomics and framebuffer reads on
+    * devices with sparse residency, branch on residency */
    bool pass_lower_descriptors = nir_shader_instructions_pass(
-      nir, try_lower_descriptors_instr, nir_metadata_control_flow, &ctx);
+      nir, try_lower_descriptors_instr, nir_metadata_none, &ctx);
 
    bool pass_lower_ssbo = nir_shader_intrinsics_pass(
       nir, lower_ssbo_descriptor, nir_metadata_control_flow, &ctx);

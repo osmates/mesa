@@ -101,6 +101,7 @@ kk_create_sparse_buffer_view(struct kk_device *dev, struct kk_buffer *buffer,
       return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
 
    view->offset_el = skip_B / texel_B;
+   view->texel_size_B = texel_B;
    view->sparse.first_tile = offset_B / KK_SPARSE_PAGE_SIZE_B;
    view->sparse.tile_count =
       DIV_ROUND_UP(skip_B + view->vk.range, KK_SPARSE_PAGE_SIZE_B);

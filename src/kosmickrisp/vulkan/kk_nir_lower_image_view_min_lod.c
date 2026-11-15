@@ -42,6 +42,10 @@ lower_min_lod(nir_builder *b, nir_tex_instr *tex, UNUSED void *data)
    bool oob_zero = tex->op == nir_texop_txf || tex->op == nir_texop_txf_ms ||
                    tex->op == nir_texop_tg4;
 
+   /* The texels below the min LOD are there, only hidden */
+   if (oob_zero && (tex->backend_flags & KK_TEXTURE_FLAG_RESIDENCY))
+      return false;
+
    b->cursor = nir_before_instr(&tex->instr);
    nir_def *min_lod = query_min_lod(b, tex, oob_zero);
 

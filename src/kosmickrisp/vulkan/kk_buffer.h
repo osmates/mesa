@@ -30,10 +30,18 @@ struct kk_buffer {
 
    /* Metal has no texture buffer over a placement sparse buffer, so each
     * texel buffer view of a sparse buffer is a placement sparse texture buffer
-    * mapped to the same heap tiles as the buffer. */
+    * mapped to the same heap tiles as the buffer.
+    *
+    * A sparse residency buffer that shaders write or query residency through
+    * has a residency mirror: tiles of its Metal buffer from mirror_tile on, one
+    * per tile, mapped to ones while that tile is mapped. Shaders see its
+    * address with addr_tag, which says how far the mirror is.
+    */
    struct {
       struct kk_sparse_tiles tiles;
       struct list_head views;
+      uint64_t mirror_tile;
+      uint64_t addr_tag;
    } sparse;
 };
 
@@ -51,6 +59,17 @@ kk_buffer_addr_range(const struct kk_buffer *buffer, uint64_t offset,
       .addr = vk_buffer_address(&buffer->vk, offset),
       .range = vk_buffer_range(&buffer->vk, offset, range),
    };
+}
+
+/* Storage buffer descriptors and buffer device addresses */
+static inline struct kk_addr_range
+kk_buffer_shader_addr_range(const struct kk_buffer *buffer, uint64_t offset,
+                            uint64_t range)
+{
+   struct kk_addr_range r = kk_buffer_addr_range(buffer, offset, range);
+   if (buffer != NULL)
+      r.addr |= buffer->sparse.addr_tag;
+   return r;
 }
 
 static inline bool

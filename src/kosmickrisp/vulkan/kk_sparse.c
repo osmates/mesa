@@ -19,6 +19,34 @@
 #include "vk_log.h"
 #include "vk_queue.h"
 
+static void
+kk_sparse_fill_ones(struct kk_bo *bo, enum kk_sparse_ones ones)
+{
+   /* An LDR void-extent block: constant (1, 1, 1, 1) for any block size */
+   static const uint8_t astc_white[16] = {
+      0xfc, 0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+   };
+   const float one[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+   uint8_t *cpu = bo->cpu;
+
+   for (uint64_t i = 0u; i < bo->size_B; i += 16u) {
+      switch (ones) {
+      case KK_SPARSE_ONES_UNORM:
+         memset(cpu + i, 0xff, 16u);
+         break;
+      case KK_SPARSE_ONES_FLOAT:
+         memcpy(cpu + i, one, 16u);
+         break;
+      case KK_SPARSE_ONES_ASTC:
+         memcpy(cpu + i, astc_white, 16u);
+         break;
+      default:
+         UNREACHABLE("Invalid heap of ones");
+      }
+   }
+}
+
 VkResult
 kk_device_init_sparse(struct kk_device *dev)
 {
@@ -43,6 +71,20 @@ kk_device_init_sparse(struct kk_device *dev)
 
    kk_device_add_heap_to_residency_set(dev, sparse->remap_heap);
    kk_device_add_buffer_to_residency_set(dev, sparse->remap_buffer);
+
+   if (dev->vk.enabled_features.sparseResidencyBuffer ||
+       dev->vk.enabled_features.sparseResidencyImage2D) {
+      for (unsigned i = 0; i < KK_SPARSE_ONES_COUNT; i++) {
+         VkResult result = kk_alloc_bo_flags(
+            dev, &dev->vk.base, KK_SPARSE_ONES_TILES * KK_SPARSE_PAGE_SIZE_B,
+            KK_SPARSE_PAGE_SIZE_B, KK_BO_SPARSE_TILES, &sparse->ones[i]);
+         if (result != VK_SUCCESS) {
+            kk_device_finish_sparse(dev);
+            return result;
+         }
+         kk_sparse_fill_ones(sparse->ones[i], i);
+      }
+   }
 
    return VK_SUCCESS;
 }
@@ -70,6 +112,10 @@ kk_device_finish_sparse(struct kk_device *dev)
    }
    if (sparse->event)
       mtl_release(sparse->event);
+   for (unsigned i = 0; i < KK_SPARSE_ONES_COUNT; i++) {
+      if (sparse->ones[i])
+         kk_destroy_bo(dev, sparse->ones[i]);
+   }
 
    kk_sparse_release_memory(dev);
    util_dynarray_fini(&sparse->released);
@@ -272,6 +318,10 @@ struct kk_bind_batch {
 
    /* Layers whose tail an opaque bind touched */
    struct util_dynarray tails;
+
+   /* Updates of residency shadows and residency mirrors, sent apart so they
+    * do not split the updates of the resources they follow */
+   struct kk_bind_batch *shadow;
 };
 
 static void
@@ -391,6 +441,12 @@ kk_bind_batch_end(struct kk_bind_batch *b)
    struct kk_sparse_device *sparse = &b->dev->sparse;
 
    kk_bind_batch_flush(b);
+   if (b->shadow != NULL) {
+      kk_bind_batch_flush(b->shadow);
+      b->unmapped |= b->shadow->unmapped;
+      util_dynarray_fini(&b->shadow->ops);
+      util_dynarray_fini(&b->shadow->tails);
+   }
 
    /* Work that read through a tile before a lone unmap keeps reading its old
     * page until the queue maps something. */
@@ -407,6 +463,52 @@ kk_bind_batch_end(struct kk_bind_batch *b)
 
    /* The unmaps of freed memory are queued, so its heaps can go */
    kk_sparse_release_memory(b->dev);
+}
+
+/* A residency shadow maps a heap of ones wherever its image maps memory, at
+ * most the heap's tiles in one operation, each from the heap's first tile. */
+static void
+kk_bind_shadow_row(struct kk_bind_batch *b,
+                   const struct kk_image_sparse *sparse, bool map,
+                   struct mtl_origin origin, uint64_t count, uint32_t level,
+                   uint32_t slice)
+{
+   if (sparse->shadow == NULL)
+      return;
+
+   struct kk_bind_batch *sb = b->shadow != NULL ? b->shadow : b;
+   mtl_heap *ones =
+      map ? b->dev->sparse.ones[sparse->shadow_ones]->mtl_handle : NULL;
+   const uint64_t step = map ? KK_SPARSE_ONES_TILES : count;
+
+   for (uint64_t x = 0u; x < count; x += step) {
+      kk_bind_texture_region(
+         sb, sparse->shadow, ones,
+         (struct mtl_origin){origin.x + x, origin.y, origin.z},
+         (struct mtl_size){MIN2(step, count - x), 1u, 1u}, level, slice, 0u);
+   }
+}
+
+static void
+kk_bind_shadow_level_tiles(struct kk_bind_batch *b,
+                           const struct kk_image_sparse *sparse, bool map,
+                           struct mtl_size tiles, uint32_t level,
+                           uint32_t slice, uint64_t first, uint64_t count)
+{
+   const uint64_t row = tiles.x;
+   const uint64_t plane = tiles.x * tiles.y;
+   const uint64_t end = first + count;
+
+   for (uint64_t i = first; i < end;) {
+      const struct mtl_origin origin = {
+         .x = i % row,
+         .y = (i / row) % tiles.y,
+         .z = i / plane,
+      };
+      const uint64_t n = MIN2(row - origin.x, end - i);
+      kk_bind_shadow_row(b, sparse, map, origin, n, level, slice);
+      i += n;
+   }
 }
 
 /* Tiles [first, first + count) of a level of tiles laid out in X, Y, then Z
@@ -480,6 +582,9 @@ kk_bind_image_tail(struct kk_bind_batch *b, struct kk_image *image,
                                    (struct mtl_origin){tile - first, 0u, 0u},
                                    (struct mtl_size){next - tile, 1u, 1u},
                                    sparse->tail_level, layer, 0u);
+            kk_bind_shadow_row(b, sparse, false,
+                               (struct mtl_origin){tile - first, 0u, 0u},
+                               next - tile, sparse->tail_level, layer);
             tile = next;
             continue;
          }
@@ -490,6 +595,9 @@ kk_bind_image_tail(struct kk_bind_batch *b, struct kk_image *image,
             (struct mtl_origin){tile - first, 0u, 0u},
             (struct mtl_size){last - tile, 1u, 1u}, sparse->tail_level, layer,
             range->heap_tile + (tile - range->tile));
+         kk_bind_shadow_row(b, sparse, true,
+                            (struct mtl_origin){tile - first, 0u, 0u},
+                            last - tile, sparse->tail_level, layer);
          tile = last;
          range = kk_sparse_range(rb_node_next(&range->node));
       }
@@ -559,6 +667,9 @@ kk_bind_image_opaque_tiles(struct kk_bind_batch *b, struct kk_image *image,
          kk_bind_level_tiles(b, plane->mtl_handle, heap,
                              kk_image_sparse_level_tiles(plane, level), level,
                              layer, first, n, heap_tile);
+         kk_bind_shadow_level_tiles(b, sparse, heap != NULL,
+                                    kk_image_sparse_level_tiles(plane, level),
+                                    level, layer, first, n);
       }
 
       tile += n;
@@ -626,6 +737,27 @@ kk_bo_heap(struct kk_bo *bo)
    return bo ? bo->mtl_handle : NULL;
 }
 
+/* Maps the mirror tiles of the tiles a bind maps to ones, and unmaps those of
+ * the tiles it unmaps */
+static void
+kk_bind_mirror_tiles(struct kk_bind_batch *b, struct kk_buffer *buffer,
+                     uint64_t tile, uint64_t count, bool map)
+{
+   struct kk_bind_batch *sb = b->shadow != NULL ? b->shadow : b;
+   const uint64_t first = buffer->sparse.mirror_tile + tile;
+
+   if (!map) {
+      kk_bind_buffer_tiles(sb, buffer->metal.handle, NULL, first, count, 0u);
+      return;
+   }
+
+   mtl_heap *ones = b->dev->sparse.ones[KK_SPARSE_ONES_UNORM]->mtl_handle;
+   for (uint64_t i = 0u; i < count; i += KK_SPARSE_ONES_TILES) {
+      kk_bind_buffer_tiles(sb, buffer->metal.handle, ones, first + i,
+                           MIN2(KK_SPARSE_ONES_TILES, count - i), 0u);
+   }
+}
+
 /* Mirrors a bind of the buffer into its texel buffer views */
 static void
 kk_bind_buffer_views(struct kk_bind_batch *b, struct kk_buffer *buffer,
@@ -684,6 +816,8 @@ kk_bind_sparse_buffer(struct kk_bind_batch *b,
       kk_bind_buffer_tiles(b, buffer->metal.handle, kk_bo_heap(bo), tile,
                            count, heap_tile);
       kk_bind_buffer_views(b, buffer, kk_bo_heap(bo), tile, count, heap_tile);
+      if (buffer->sparse.mirror_tile != 0u)
+         kk_bind_mirror_tiles(b, buffer, tile, count, bo != NULL);
    }
 
    return result;
@@ -818,6 +952,8 @@ kk_bind_sparse_image(struct kk_bind_batch *b,
             kk_bind_texture_region(b, plane->mtl_handle, kk_bo_heap(bo), row,
                                    (struct mtl_size){size.x, 1u, 1u}, level,
                                    layer, row_heap_tile);
+            kk_bind_shadow_row(b, sparse, bo != NULL, row, size.x, level,
+                               layer);
          }
       }
    }
@@ -835,11 +971,18 @@ kk_queue_bind_sparse(struct kk_queue *queue, struct vk_queue_submit *submit)
    if (!sparse->enabled)
       return VK_SUCCESS;
 
+   struct kk_bind_batch shadow = {
+      .dev = dev,
+      .queue = queue,
+      .ops = UTIL_DYNARRAY_INIT,
+      .tails = UTIL_DYNARRAY_INIT,
+   };
    struct kk_bind_batch b = {
       .dev = dev,
       .queue = queue,
       .ops = UTIL_DYNARRAY_INIT,
       .tails = UTIL_DYNARRAY_INIT,
+      .shadow = &shadow,
    };
 
    simple_mtx_lock(&sparse->lock);
@@ -870,11 +1013,56 @@ kk_queue_bind_sparse(struct kk_queue *queue, struct vk_queue_submit *submit)
    return result;
 }
 
-void
-kk_sparse_buffer_init(struct kk_buffer *buffer)
+/* Shaders write sparse residency buffers through storage descriptors, buffer
+ * device addresses and storage texel buffers, and query residency through
+ * texel buffers. Those get a mirror, a power of two of bytes after the start
+ * of the Metal buffer, so a few bits of the address say where it is. 0 for
+ * none.
+ */
+uint64_t
+kk_sparse_buffer_mirror_tile(const struct kk_device *dev,
+                             const struct kk_buffer *buffer)
+{
+   const VkBufferUsageFlags2KHR usage =
+      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+      VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+      VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT |
+      VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
+
+   if (!(buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_RESIDENCY_BIT) ||
+       !(buffer->vk.usage & usage) ||
+       dev->sparse.ones[KK_SPARSE_ONES_UNORM] == NULL)
+      return 0u;
+
+   const uint64_t tiles = DIV_ROUND_UP(buffer->vk.size, KK_SPARSE_PAGE_SIZE_B);
+   return util_next_power_of_two64(MAX2(tiles, 1u));
+}
+
+VkResult
+kk_sparse_buffer_init(struct kk_device *dev, struct kk_buffer *buffer,
+                      uint64_t mirror_tile)
 {
    kk_sparse_tiles_init(&buffer->sparse.tiles);
    list_inithead(&buffer->sparse.views);
+   buffer->sparse.mirror_tile = mirror_tile;
+   buffer->sparse.addr_tag = 0u;
+
+   if (mirror_tile == 0u)
+      return VK_SUCCESS;
+
+   /* The tag goes above every address of the buffer and its mirror */
+   const uint64_t tiles = DIV_ROUND_UP(buffer->vk.size, KK_SPARSE_PAGE_SIZE_B);
+   const uint64_t end = mtl_buffer_get_gpu_address(buffer->metal.handle) +
+                        (mirror_tile + tiles) * KK_SPARSE_PAGE_SIZE_B;
+   if (end > BITFIELD64_BIT(KK_SPARSE_TAG_SHIFT))
+      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY,
+                       "Sparse buffer address above the residency tag");
+
+   const uint64_t tag = util_logbase2_64(mirror_tile) + 1u;
+   assert(tag < BITFIELD_BIT(KK_SPARSE_TAG_BITS));
+   buffer->sparse.addr_tag = tag << KK_SPARSE_TAG_SHIFT;
+
+   return VK_SUCCESS;
 }
 
 void
@@ -920,6 +1108,14 @@ kk_sparse_buffer_add_view(struct kk_device *dev, struct kk_buffer *buffer,
 
    view->sparse.buffer = buffer;
    list_addtail(&view->sparse.link, &buffer->sparse.views);
+
+   if (buffer->sparse.mirror_tile != 0u) {
+      view->residency_addr =
+         mtl_buffer_get_gpu_address(buffer->metal.handle) +
+         (buffer->sparse.mirror_tile + view->sparse.first_tile) *
+            KK_SPARSE_PAGE_SIZE_B;
+      view->residency_tiles = view->sparse.tile_count;
+   }
 
    /* Map the tiles the buffer has now. Binds after this map them too. */
    if (!rb_tree_is_empty(&buffer->sparse.tiles.ranges)) {

@@ -191,7 +191,8 @@ bool
 kk_nir_lower_descriptors(nir_shader *nir,
                          const struct vk_pipeline_robustness_state *rs,
                          uint32_t set_layout_count,
-                         struct vk_descriptor_set_layout *const *set_layouts);
+                         struct vk_descriptor_set_layout *const *set_layouts,
+                         bool sparse_texel_buffers, bool sparse_images);
 
 /* KK_WORKAROUND_18 */
 bool kk_nir_add_device_barrier_workaround(nir_shader *nir);
@@ -211,6 +212,12 @@ bool kk_nir_lower_fs_multiview(nir_shader *nir, uint32_t view_mask);
  * at an explicit level that already includes the image view's min LOD
  */
 #define KK_TEXTURE_FLAG_REDUCTION_TAP (1 << 1)
+
+/* Reads the image's residency shadow, through its residency sampler */
+#define KK_TEXTURE_FLAG_RESIDENCY (1 << 2)
+
+bool kk_nir_lower_residency(nir_shader *nir);
+bool kk_nir_lower_sparse_buffer_access(nir_shader *nir);
 
 bool
 kk_nir_lower_sampler_minmax(nir_shader *nir, uint32_t set_layout_count,
