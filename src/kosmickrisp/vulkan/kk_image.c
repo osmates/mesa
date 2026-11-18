@@ -108,8 +108,8 @@ kk_get_image_plane_format_features(struct kk_physical_device *pdev,
    }
 
    /* We disable A8 format due to lower blend pass issues */
-   if (va_format->color && tiling != VK_IMAGE_TILING_LINEAR &&
-       vk_format != VK_FORMAT_A8_UNORM) {
+   /* Metal renders to linear (buffer-backed) 2D textures too. */
+   if (va_format->color && vk_format != VK_FORMAT_A8_UNORM) {
       features |= VK_FORMAT_FEATURE_2_COLOR_ATTACHMENT_BIT;
       features |= VK_FORMAT_FEATURE_2_BLIT_DST_BIT;
       // TODO_KOSMICKRISP Support snorm formats once the following spec issue is
@@ -455,15 +455,15 @@ kk_GetPhysicalDeviceImageFormatProperties2(
        pImageFormatInfo->type == VK_IMAGE_TYPE_3D)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
-   /* TODO_KOSMICKRISP Linear images cannot be used as color attachments as long
-    * as input attachments are changed to arrays. Vulkan specifies that any
-    * image format supporting the color attachment feature also supports being
-    * used as an input attachment, and Metal disallows arrays for linear
-    * textures.
+   /* Input attachments are read through 2D array views, and Metal has no
+    * array views of linear textures. A linear 2D image can still be a color
+    * attachment: Metal renders to buffer-backed 2D textures.
     */
    if (pImageFormatInfo->tiling == VK_IMAGE_TILING_LINEAR &&
-       (all_usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)))
+       ((all_usage & (VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT |
+                      VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT)) ||
+        ((all_usage & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) &&
+         pImageFormatInfo->type != VK_IMAGE_TYPE_2D)))
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
    if (ycbcr_info && pImageFormatInfo->type != VK_IMAGE_TYPE_2D)
