@@ -415,6 +415,25 @@ alu_to_msl(struct nir_to_msl_ctx *ctx, nir_alu_instr *instr)
    case nir_op_fsat:
       alu_funclike(ctx, instr, "saturate");
       break;
+   case nir_op_fcanonicalize:
+      /* nir_opt_algebraic keeps fcanonicalize only where the shader asks to
+       * flush denormals. The device does not advertise that mode, but
+       * dxil-spirv sets it for DXBC shaders anyway, so flush here.
+       */
+      if (nir_is_denorm_flush_to_zero(
+             ctx->shader->info.float_controls_execution_mode,
+             instr->def.bit_size)) {
+         P(ctx, "select(");
+         alu_src_to_msl(ctx, instr, 0);
+         P(ctx, ", ");
+         alu_src_to_msl(ctx, instr, 0);
+         P(ctx, " * 0, abs(");
+         alu_src_to_msl(ctx, instr, 0);
+         P(ctx, ") < %s)", instr->def.bit_size == 16 ? "HALF_MIN" : "FLT_MIN");
+      } else {
+         alu_src_to_msl(ctx, instr, 0);
+      }
+      break;
    /* Functions from <metal_relational> */
    case nir_op_fisfinite:
       alu_funclike(ctx, instr, "isfinite");
